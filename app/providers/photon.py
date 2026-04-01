@@ -6,6 +6,8 @@ import httpx
 from app.config import settings
 from app.providers.base import ProviderPlace
 
+SUPPORTED_PHOTON_LANGUAGES = {"default", "de", "en", "fr"}
+
 
 async def search_photon(
     client: httpx.AsyncClient,
@@ -14,12 +16,15 @@ async def search_photon(
     country_filter_code: str | None,
     limit: int,
 ) -> list[ProviderPlace]:
-    lang = normalize_photon_language(language)
     params = {
         "q": query,
-        "lang": lang,
         "limit": max(limit, 12),
     }
+
+    lang = normalize_photon_language(language)
+    if lang != "default":
+        params["lang"] = lang
+
     if country_filter_code:
         params["osm_tag"] = f"place:{country_filter_code.lower()}"
 
@@ -80,12 +85,15 @@ async def search_photon(
 
 
 def normalize_photon_language(language: str) -> str:
-    primary = language.split(",")[0].strip()
+    primary = language.split(",")[0].strip().lower()
     if not primary:
-        return "en"
+        return "default"
 
-    base = primary.split("-")[0].split("_")[0].strip().lower()
-    if not base:
-        return "en"
+    candidate = primary.split("-")[0].split("_")[0].strip()
+    if candidate in SUPPORTED_PHOTON_LANGUAGES:
+        return candidate
 
-    return base
+    if primary in SUPPORTED_PHOTON_LANGUAGES:
+        return primary
+
+    return "default"

@@ -96,6 +96,9 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
                         providers_used.append("nominatim")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("nominatim failed query=%s error=%r", candidate, exc)
+                    if isinstance(exc, httpx.HTTPStatusError):
+                        logger.warning("nominatim response body=%s", exc.response.text[:300])
+
 
             if settings.enable_photon and len(merged) < max(request.limit, 8):
                 try:
@@ -112,6 +115,9 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
                         providers_used.append("photon")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("photon failed query=%s error=%r", candidate, exc)
+                    if isinstance(exc, httpx.HTTPStatusError):
+                        logger.warning("photon response body=%s", exc.response.text[:300])
+
 
     results = rank_and_convert(merged, request)
     response = PlaceSearchResponse(
@@ -128,7 +134,7 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
             self_hosted_data=False,
         ),
     )
-    if cache is not None:
+    if cache is not None and response.results:
         cache.set(
             cache_key,
             json.loads(response.model_dump_json()),
@@ -163,7 +169,7 @@ def build_queries(query: str, request: PlaceSearchRequest) -> list[str]:
 
 
 def build_cache_key(request: PlaceSearchRequest) -> str:
-    payload = json.dumps(request.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+    payload = json.dumps({"cache_version": 2, **request.model_dump(mode="json")}, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 def rank_and_convert(items: list[ProviderPlace], request: PlaceSearchRequest) -> list[PlaceResult]:
