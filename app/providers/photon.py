@@ -14,9 +14,10 @@ async def search_photon(
     country_filter_code: str | None,
     limit: int,
 ) -> list[ProviderPlace]:
+    lang = normalize_photon_language(language)
     params = {
         "q": query,
-        "lang": language.split(",")[0],
+        "lang": lang,
         "limit": max(limit, 12),
     }
     if country_filter_code:
@@ -76,3 +77,15 @@ async def search_photon(
             )
         )
     return items
+
+
+def normalize_photon_language(language: str) -> str:
+    primary = language.split(",")[0].strip()
+    if not primary:
+        return "en"
+
+    base = primary.split("-")[0].split("_")[0].strip().lower()
+    if not base:
+        return "en"
+
+    return base

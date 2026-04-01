@@ -95,7 +95,7 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
                     if "nominatim" not in providers_used:
                         providers_used.append("nominatim")
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("nominatim failed query=%s error=%s", candidate, exc)
+                    logger.warning("nominatim failed query=%s error=%r", candidate, exc)
 
             if settings.enable_photon and len(merged) < max(request.limit, 8):
                 try:
@@ -111,7 +111,7 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
                     if "photon" not in providers_used:
                         providers_used.append("photon")
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("photon failed query=%s error=%s", candidate, exc)
+                    logger.warning("photon failed query=%s error=%r", candidate, exc)
 
     results = rank_and_convert(merged, request)
     response = PlaceSearchResponse(
