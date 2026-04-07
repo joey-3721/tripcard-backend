@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import logging
@@ -505,16 +506,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
         activities: list[ActivityResponse] = []
         for act_idx, act in enumerate(day.get("activities", [])):
             location = location_map.get((day_idx, act_idx))
-            # If no geocoded location, create a stub with the title
-            if location is None and act.get("title"):
-                location = TripLocationResponse(
-                    name=act.get("searchName") or act["title"],
-                    country="",
-                    countryCode="",
-                    locality="",
-                    category=act.get("category", "other"),
-                )
-            elif location is not None:
+            if location is not None:
                 geocoded_locations.append(location)
 
             activities.append(ActivityResponse(
@@ -777,9 +769,13 @@ def select_best_geocode_result(ranked: list, search_name: str, title: str, categ
         if result_matches_hints(item, strict_hints):
             return item
         logger.info("ai geocode reject title=%s candidate=%s reason=hint_mismatch", title, item.name)
-    if category != "attraction":
+    if category not in {"attraction", "shopping"}:
         return None
-    for item in ranked:
+    fallback_candidates = sorted(
+        ranked,
+        key=lambda item: fallback_candidate_rank(item, title),
+    )
+    for item in fallback_candidates:
         if should_reject_result(item, category):
             continue
         if has_strict_identity_requirement(search_name, title, category) and not matches_strict_identity(item, search_name, title):
@@ -816,6 +812,8 @@ def result_matches_hints(item, hints: tuple[str, ...]) -> bool:
     for hint in hints:
         if hint in candidate_name or candidate_name in hint:
             return True
+        if soft_name_match(hint, candidate_name):
+            return True
     return False
 
 
@@ -851,14 +849,17 @@ def matches_strict_identity(item, search_name: str, title: str) -> bool:
 
 
 def is_reasonably_confident_result(item, category: str) -> bool:
-    if category != "attraction":
+    if category not in {"attraction", "shopping"}:
         return True
 
     score = float(getattr(item, "score", 0.0) or 0.0)
     matched_by = set(getattr(item, "matched_by", []) or [])
     has_name_signal = bool({"name_exact", "name_prefix", "name_contains"} & matched_by)
     has_context_signal = "destination_context_match" in matched_by or "address_contains" in matched_by
-    return score >= MIN_ATTRACTION_CONFIDENCE_SCORE and (has_name_signal or has_context_signal)
+    has_strong_context = "preferred_country_boost" in matched_by and "destination_context_match" in matched_by
+    if score >= MIN_ATTRACTION_CONFIDENCE_SCORE and (has_name_signal or has_context_signal):
+        return True
+    return score >= 0.70 and has_strong_context
 
 
 def should_reject_result(item, category: str) -> bool:
@@ -886,6 +887,64 @@ def compact_match_key(value: str | None) -> str:
     normalized = normalized.replace("'", " ")
     normalized = re.sub(r"[^\w\u4e00-\u9fff]+", " ", normalized)
     return "".join(normalized.split())
+
+
+def soft_name_match(left: str, right: str) -> bool:
+    compact_left = compact_match_key(left)
+    compact_right = compact_match_key(right)
+    if not compact_left or not compact_right:
+        return False
+    if compact_left == compact_right:
+        return True
+    if compact_left in compact_right or compact_right in compact_left:
+        return True
+    cjk_left = cjk_only(compact_left)
+    cjk_right = cjk_only(compact_right)
+    if cjk_left and cjk_right:
+        similarity = difflib.SequenceMatcher(None, cjk_left, cjk_right).ratio()
+        if similarity >= 0.5:
+            return True
+    overlap = ngram_overlap(compact_left, compact_right)
+    return overlap >= 0.72
+
+
+def cjk_only(value: str) -> str:
+    return "".join(ch for ch in value if "\u4e00" <= ch <= "\u9fff")
+
+
+def fallback_candidate_rank(item, title: str) -> tuple[int, int, int, int, str]:
+    candidate_name = compact_match_key(getattr(item, "name", "") or "")
+    title_cjk = cjk_only(compact_match_key(title))
+    candidate_cjk = cjk_only(candidate_name)
+    cjk_match = 1
+    cjk_similarity_bucket = 0
+    if title_cjk:
+        cjk_match = 0 if candidate_cjk else 1
+        similarity = difflib.SequenceMatcher(None, title_cjk, candidate_cjk).ratio() if candidate_cjk else 0.0
+        cjk_similarity_bucket = -int(similarity * 100)
+    return (
+        cjk_match,
+        cjk_similarity_bucket,
+        len(candidate_name),
+        0 if getattr(item, "address", None) else 1,
+        candidate_name,
+    )
+
+
+def ngram_overlap(left: str, right: str) -> float:
+    left_ngrams = character_ngrams(left)
+    right_ngrams = character_ngrams(right)
+    if not left_ngrams or not right_ngrams:
+        return 0.0
+    return len(left_ngrams & right_ngrams) / len(left_ngrams)
+
+
+def character_ngrams(text: str) -> set[str]:
+    if not text:
+        return set()
+    if len(text) == 1:
+        return {text}
+    return {text[index : index + 2] for index in range(len(text) - 1)}
 
 
 def summarize_ranked_candidates(ranked: list, limit: int = 3) -> list[str]:
