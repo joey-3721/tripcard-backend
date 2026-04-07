@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
+import unicodedata
 import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.cache_mysql import MySQLCache
@@ -15,11 +17,19 @@ from app.config import settings
 from app.providers.base import ProviderPlace
 from app.providers.nominatim import search_nominatim
 from app.providers.photon import search_photon
-from app.schemas import PlaceResult, PlaceSearchMeta, PlaceSearchRequest, PlaceSearchResponse
+from app.schemas import (
+    ParseItineraryRequest,
+    ParseItineraryResponse,
+    PlaceResult,
+    PlaceSearchMeta,
+    PlaceSearchRequest,
+    PlaceSearchResponse,
+)
 
 logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
 logger = logging.getLogger("tripcard-backend")
 cache = MySQLCache() if settings.cache_enabled else None
+db = MySQLCache()  # for ai_tokens table operations
 
 
 @asynccontextmanager
@@ -28,6 +38,7 @@ async def lifespan(_: FastAPI):
     if cache is not None:
         cache.ensure_table()
         cache.cleanup()
+    db.ensure_ai_tokens_table()
     yield
 
 
@@ -169,7 +180,7 @@ def build_queries(query: str, request: PlaceSearchRequest) -> list[str]:
 
 
 def build_cache_key(request: PlaceSearchRequest) -> str:
-    payload = json.dumps({"cache_version": 2, **request.model_dump(mode="json")}, ensure_ascii=False, sort_keys=True)
+    payload = json.dumps({"cache_version": 3, **request.model_dump(mode="json")}, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 def rank_and_convert(items: list[ProviderPlace], request: PlaceSearchRequest) -> list[PlaceResult]:
@@ -177,13 +188,40 @@ def rank_and_convert(items: list[ProviderPlace], request: PlaceSearchRequest) ->
     seen: set[str] = set()
     results: list[PlaceResult] = []
     normalized_query = normalize(request.query)
+    query_forms = normalized_forms(request.query)
+    strong_preferred_match_exists = has_strong_preferred_match(items, request, query_forms, preferred_codes)
+    strong_nominatim_match_exists = has_strong_nominatim_match(items, request, query_forms, preferred_codes)
 
     scored = sorted(
         items,
-        key=lambda item: ranking_tuple(item, normalized_query, preferred_codes, request.country_filter_code),
+        key=lambda item: ranking_tuple(
+            item,
+            request,
+            normalized_query,
+            query_forms,
+            preferred_codes,
+            request.country_filter_code,
+            strong_preferred_match_exists,
+            strong_nominatim_match_exists,
+        ),
     )
 
     for item in scored:
+        item_query_rank = query_match_rank(
+            item,
+            request,
+            normalized_query,
+            query_forms,
+            normalized_forms(item.name, item.address, item.subtitle, item.locality),
+        )
+        if (
+            strong_preferred_match_exists
+            and preferred_codes
+            and item.country_code.upper() not in preferred_codes
+            and item_query_rank >= 4
+        ):
+            continue
+
         dedupe_key = "|".join(
             [
                 normalize(item.name),
@@ -210,8 +248,8 @@ def rank_and_convert(items: list[ProviderPlace], request: PlaceSearchRequest) ->
                 category=request.category,
                 provider=item.provider,
                 provider_place_id=item.provider_place_id,
-                score=score_value(item, normalized_query, preferred_codes),
-                matched_by=matched_by(item, normalized_query, preferred_codes),
+                score=score_value(item, request, normalized_query, query_forms, preferred_codes),
+                matched_by=matched_by(item, request, normalized_query, query_forms, preferred_codes),
             )
         )
     return results
@@ -219,13 +257,19 @@ def rank_and_convert(items: list[ProviderPlace], request: PlaceSearchRequest) ->
 
 def ranking_tuple(
     item: ProviderPlace,
+    request: PlaceSearchRequest,
     normalized_query: str,
+    query_forms: set[str],
     preferred_codes: set[str],
     country_filter_code: str | None,
-) -> tuple[int, int, int, int, str]:
+    strong_preferred_match_exists: bool,
+    strong_nominatim_match_exists: bool,
+) -> tuple[int, int, int, int, int, int, str]:
     code = item.country_code.upper()
     normalized_name = normalize(item.name)
     normalized_address = normalize(item.address or "")
+    item_forms = normalized_forms(item.name, item.address, item.subtitle, item.locality)
+    query_rank = query_match_rank(item, request, normalized_query, query_forms, item_forms)
 
     if country_filter_code and code == country_filter_code.upper():
         filter_rank = 0
@@ -234,53 +278,251 @@ def ranking_tuple(
     else:
         filter_rank = 0
 
-    if normalized_name == normalized_query:
-        query_rank = 0
-    elif normalized_name.startswith(normalized_query):
-        query_rank = 1
-    elif normalized_query in normalized_name:
-        query_rank = 2
-    elif normalized_query in normalized_address:
-        query_rank = 3
-    else:
-        query_rank = 4
-
     preferred_rank = 0 if preferred_codes and code in preferred_codes else 1
     address_rank = 0 if item.address else 1
-    return (filter_rank, query_rank, preferred_rank, address_rank, normalized_name)
+    locality_rank = locality_context_rank(item, request)
+
+    provider_rank = 0
+    if strong_nominatim_match_exists and item.provider != "nominatim" and query_rank <= 2:
+        provider_rank = 1
+
+    country_focus_rank = 0
+    if strong_preferred_match_exists and preferred_codes and code not in preferred_codes:
+        country_focus_rank = 1
+
+    return (
+        filter_rank,
+        query_rank,
+        country_focus_rank,
+        preferred_rank,
+        provider_rank,
+        locality_rank + address_rank,
+        normalized_name or normalized_address,
+    )
 
 
-def score_value(item: ProviderPlace, normalized_query: str, preferred_codes: set[str]) -> float:
+def score_value(
+    item: ProviderPlace,
+    request: PlaceSearchRequest,
+    normalized_query: str,
+    query_forms: set[str],
+    preferred_codes: set[str],
+) -> float:
     score = 0.5
-    name = normalize(item.name)
-    if name == normalized_query:
+    item_forms = normalized_forms(item.name, item.address, item.subtitle, item.locality)
+    query_rank = query_match_rank(item, request, normalized_query, query_forms, item_forms)
+    if query_rank == 0:
         score += 0.35
-    elif name.startswith(normalized_query):
+    elif query_rank == 1:
         score += 0.25
-    elif normalized_query in name:
+    elif query_rank == 2:
         score += 0.15
+    elif query_rank == 3:
+        score += 0.08
     if preferred_codes and item.country_code.upper() in preferred_codes:
         score += 0.12
+    if locality_context_rank(item, request) == 0:
+        score += 0.06
     if item.address:
         score += 0.03
     return min(score, 0.99)
 
 
-def matched_by(item: ProviderPlace, normalized_query: str, preferred_codes: set[str]) -> list[str]:
+def matched_by(
+    item: ProviderPlace,
+    request: PlaceSearchRequest,
+    normalized_query: str,
+    query_forms: set[str],
+    preferred_codes: set[str],
+) -> list[str]:
     marks: list[str] = []
-    name = normalize(item.name)
-    if name == normalized_query:
+    item_forms = normalized_forms(item.name, item.address, item.subtitle, item.locality)
+    query_rank = query_match_rank(item, request, normalized_query, query_forms, item_forms)
+    if query_rank == 0:
         marks.append("name_exact")
-    elif name.startswith(normalized_query):
+    elif query_rank == 1:
         marks.append("name_prefix")
-    elif normalized_query in name:
+    elif query_rank == 2:
         marks.append("name_contains")
+    elif query_rank == 3:
+        marks.append("address_contains")
     if preferred_codes and item.country_code.upper() in preferred_codes:
         marks.append("preferred_country_boost")
+    if locality_context_rank(item, request) == 0:
+        marks.append("destination_context_match")
     if item.address:
         marks.append("has_address")
     return marks
 
 
 def normalize(text: str) -> str:
-    return " ".join(text.lower().strip().split())
+    folded = unicodedata.normalize("NFKC", text).lower()
+    folded = re.sub(r"[^\w\u4e00-\u9fff]+", " ", folded)
+    return " ".join(folded.strip().split())
+
+
+def normalized_forms(*values: str | None) -> set[str]:
+    forms: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        normalized = normalize(value)
+        if not normalized:
+            continue
+        forms.add(normalized)
+        compact = compact_text(normalized)
+        if compact:
+            forms.add(compact)
+    return {form for form in forms if form}
+
+
+def query_match_rank(
+    item: ProviderPlace,
+    request: PlaceSearchRequest,
+    normalized_query: str,
+    query_forms: set[str],
+    item_forms: set[str],
+) -> int:
+    if not item_forms:
+        return 5
+
+    compact_query = compact_text(normalized_query)
+    compact_item_forms = {compact_text(form) for form in item_forms if compact_text(form)}
+    if compact_query in compact_item_forms:
+        return 0
+
+    for form in compact_item_forms:
+        if form.startswith(compact_query):
+            return 1
+    for form in compact_item_forms:
+        if compact_query and compact_query in form:
+            return 2
+
+    address_forms = normalized_forms(item.address, item.subtitle)
+    compact_address_forms = {compact_text(form) for form in address_forms if compact_text(form)}
+    for form in compact_address_forms:
+        if compact_query and compact_query in form:
+            return 3
+
+    if destination_context_match(item, request):
+        return 4
+
+    return 5
+
+
+def locality_context_rank(item: ProviderPlace, request: PlaceSearchRequest) -> int:
+    if destination_context_match(item, request):
+        return 0
+    return 1
+
+
+def has_strong_preferred_match(
+    items: list[ProviderPlace],
+    request: PlaceSearchRequest,
+    query_forms: set[str],
+    preferred_codes: set[str],
+) -> bool:
+    if not preferred_codes:
+        return False
+    for item in items:
+        if item.country_code.upper() not in preferred_codes:
+            continue
+        if query_match_rank(
+            item,
+            request,
+            normalize(request.query),
+            query_forms,
+            normalized_forms(item.name, item.address, item.subtitle, item.locality),
+        ) <= 4:
+            return True
+    return False
+
+
+def has_strong_nominatim_match(
+    items: list[ProviderPlace],
+    request: PlaceSearchRequest,
+    query_forms: set[str],
+    preferred_codes: set[str],
+) -> bool:
+    for item in items:
+        if item.provider != "nominatim":
+            continue
+        if preferred_codes and item.country_code.upper() not in preferred_codes:
+            continue
+        if query_match_rank(
+            item,
+            request,
+            normalize(request.query),
+            query_forms,
+            normalized_forms(item.name, item.address, item.subtitle, item.locality),
+        ) <= 4:
+            return True
+    return False
+
+
+def compact_text(text: str) -> str:
+    return normalize(text).replace(" ", "")
+
+
+def destination_context_match(item: ProviderPlace, request: PlaceSearchRequest) -> bool:
+    if not request.destination_context:
+        return False
+
+    candidate_forms = {
+        compact_text(value)
+        for value in (item.locality or "", item.subtitle or "", item.address or "", item.name or "")
+        if compact_text(value)
+    }
+    if not candidate_forms:
+        return False
+
+    for destination in request.destination_context.destinations:
+        destination_name = compact_text(destination.name)
+        if not destination_name:
+            continue
+        if destination.country_code and item.country_code.upper() != destination.country_code.upper():
+            continue
+        for candidate in candidate_forms:
+            if destination_name in candidate:
+                return True
+            if ngram_overlap(destination_name, candidate) >= 0.5:
+                return True
+    return False
+
+
+def ngram_overlap(left: str, right: str) -> float:
+    left_ngrams = character_ngrams(left)
+    right_ngrams = character_ngrams(right)
+    if not left_ngrams or not right_ngrams:
+        return 0.0
+    return len(left_ngrams & right_ngrams) / len(left_ngrams)
+
+
+def character_ngrams(text: str) -> set[str]:
+    if not text:
+        return set()
+    if len(text) == 1:
+        return {text}
+    return {text[index : index + 2] for index in range(len(text) - 1)}
+
+
+# ── AI Itinerary Parsing ──
+
+@app.post("/v1/ai/parse-itinerary", response_model=ParseItineraryResponse)
+async def parse_itinerary_endpoint(request: ParseItineraryRequest) -> ParseItineraryResponse:
+    if not settings.ai_parse_enabled:
+        raise HTTPException(status_code=503, detail="AI parsing is disabled")
+
+    from app.ai_service import parse_itinerary
+
+    try:
+        return await parse_itinerary(request.text, request.destination, request.language)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="AI service timeout")
+    except httpx.HTTPStatusError as exc:
+        logger.error("DeepSeek API error: %s %s", exc.response.status_code, exc.response.text[:300])
+        raise HTTPException(status_code=502, detail=f"AI service error: {exc.response.status_code}")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON response")

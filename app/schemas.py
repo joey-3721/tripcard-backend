@@ -68,3 +68,56 @@ class PlaceSearchResponse(BaseModel):
     trace_id: str
     results: list[PlaceResult]
     meta: PlaceSearchMeta
+
+
+# ── AI Itinerary Parsing ──
+
+ActivityCategoryType = Literal[
+    "attraction", "restaurant", "hotel", "transport", "shopping", "other"
+]
+
+
+class ParseItineraryRequest(BaseModel):
+    text: str = Field(..., min_length=10, max_length=10000)
+    destination: str | None = Field(
+        default=None,
+        description="Primary destination hint, e.g. '巴黎' or 'Paris, France'",
+    )
+    language: str = "zh-CN"
+
+
+class TripLocationResponse(BaseModel):
+    name: str
+    address: str = ""
+    latitude: float = 0.0
+    longitude: float = 0.0
+    placeID: str | None = None
+    category: ActivityCategoryType = "other"
+
+
+class ActivityResponse(BaseModel):
+    id: str
+    title: str
+    category: ActivityCategoryType = "other"
+    location: TripLocationResponse | None = None
+    startTime: str | None = None
+    endTime: str | None = None
+    notes: str = ""
+    cost: float | None = None
+    currency: str = "CNY"
+
+
+class DayPlanResponse(BaseModel):
+    id: str
+    dayNumber: int
+    date: str | None = None
+    activities: list[ActivityResponse]
+    notes: str = ""
+
+
+class ParseItineraryResponse(BaseModel):
+    destination: str
+    totalDays: int
+    dayPlans: list[DayPlanResponse]
+    rawAiOutput: dict | None = None
+    warnings: list[str] = Field(default_factory=list)

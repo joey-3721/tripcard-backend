@@ -32,6 +32,12 @@ class Settings(BaseSettings):
 
     cors_allow_origins: list[str] = ["*"]
 
+    ai_parse_enabled: bool = True
+    ai_tokens_table_name: str = "ai_tokens"
+    ai_request_timeout_seconds: float = 60.0
+    ai_max_input_length: int = 10000
+    ai_geocode_concurrency: int = 5
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

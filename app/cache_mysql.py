@@ -81,3 +81,32 @@ class MySQLCache:
                 cur.execute(
                     f"DELETE FROM `{self.table_name}` WHERE expires_at <= NOW()"
                 )
+
+    def ensure_ai_tokens_table(self) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS `{settings.ai_tokens_table_name}` (
+                        id          INT AUTO_INCREMENT PRIMARY KEY,
+                        provider    VARCHAR(32)  NOT NULL,
+                        token       VARCHAR(512) NOT NULL,
+                        model       VARCHAR(64)  NOT NULL DEFAULT 'deepseek-chat',
+                        base_url    VARCHAR(256) NOT NULL DEFAULT 'https://api.deepseek.com',
+                        enabled     TINYINT(1)   NOT NULL DEFAULT 1,
+                        created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_provider_enabled (provider, enabled)
+                    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                    """
+                )
+
+    def get_ai_token(self, provider: str = "deepseek") -> dict | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT token, model, base_url FROM `{settings.ai_tokens_table_name}` "
+                    "WHERE provider = %s AND enabled = 1 LIMIT 1",
+                    (provider,),
+                )
+                return cur.fetchone()
