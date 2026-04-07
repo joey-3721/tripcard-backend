@@ -76,6 +76,102 @@ LANDMARK_QUERY_REWRITES: dict[str, tuple[str, ...]] = {
     ),
 }
 
+ATTRACTION_RESULT_REJECT_TOKENS = (
+    "hotel",
+    "hostel",
+    "inn",
+    "guesthouse",
+    "apartment",
+    "road",
+    "street",
+    "highway",
+    "metro",
+    "subway",
+    "line",
+    "station",
+    "book mansion",
+    "grand hotel",
+    "express hotel",
+    "mansion beijing",
+)
+
+CANONICAL_ACTIVITY_RULES: dict[str, dict] = {
+    "国博": {
+        "title": "中国国家博物馆",
+        "search_name": "National Museum of China Beijing China",
+        "acceptable": ("中国国家博物馆", "national museum of china"),
+    },
+    "故宫": {
+        "title": "故宫博物院",
+        "search_name": "Palace Museum Beijing China",
+        "acceptable": ("故宫博物院", "故宫", "palace museum", "forbidden city"),
+    },
+    "天安门": {
+        "title": "天安门广场",
+        "search_name": "Tiananmen Square Beijing China",
+        "acceptable": ("天安门广场", "天安门", "tiananmen square"),
+    },
+    "天坛": {
+        "title": "天坛公园",
+        "search_name": "Temple of Heaven Beijing China",
+        "acceptable": ("天坛公园", "天坛", "temple of heaven"),
+    },
+    "鸟巢": {
+        "title": "国家体育场",
+        "search_name": "National Stadium Beijing China",
+        "acceptable": ("国家体育场", "national stadium", "bird s nest"),
+    },
+    "水立方": {
+        "title": "国家游泳中心",
+        "search_name": "National Aquatics Center Beijing China",
+        "acceptable": ("国家游泳中心", "national aquatics center", "water cube"),
+    },
+    "什刹海": {
+        "title": "什刹海风景区",
+        "search_name": "Shichahai Scenic Area Beijing China",
+        "acceptable": ("什刹海", "什刹海风景区", "shichahai"),
+    },
+    "恭王府": {
+        "title": "恭王府",
+        "search_name": "Prince Gong Mansion Beijing China",
+        "acceptable": ("恭王府", "prince gong mansion"),
+    },
+    "北海": {
+        "title": "北海公园",
+        "search_name": "Beihai Park Beijing China",
+        "acceptable": ("北海公园", "beihai park"),
+    },
+    "景山": {
+        "title": "景山公园",
+        "search_name": "Jingshan Park Beijing China",
+        "acceptable": ("景山公园", "jingshan park"),
+    },
+    "三里屯": {
+        "title": "三里屯太古里",
+        "search_name": "Sanlitun Taikoo Li Beijing China",
+        "acceptable": ("三里屯", "三里屯太古里", "sanlitun taikoo li", "sanlitun"),
+    },
+    "环球影城": {
+        "title": "北京环球影城",
+        "search_name": "Universal Beijing Resort China",
+        "acceptable": ("北京环球影城", "universal beijing resort", "universal studios beijing"),
+    },
+    "清北": {
+        "split": (
+            {
+                "title": "清华大学",
+                "searchName": "Tsinghua University Beijing China",
+                "category": "attraction",
+            },
+            {
+                "title": "北京大学",
+                "searchName": "Peking University Beijing China",
+                "category": "attraction",
+            },
+        ),
+    },
+}
+
 SYSTEM_PROMPT = """\
 You are a travel itinerary parser. The user will give you raw travel plan text \
 (possibly in Chinese, English, or mixed). Extract a structured itinerary.
@@ -93,15 +189,19 @@ Return ONLY valid JSON, no markdown fences, no explanation. The JSON schema:
       "dayNumber": 1,
       "activities": [
         {
-          "title": "place display name in the original language",
-          "searchName": "ENGLISH search query for geocoding, include city in English, e.g. 'Louvre Museum Paris France' or 'Eiffel Tower Paris' or 'Notre-Dame Cathedral Paris'",
+          "title": "standard full place name in the original language, NOT a shorthand, e.g. '中国国家博物馆' instead of '国博'",
+          "originalMention": "the original mention from user text, may be shorthand like '国博' or '清北'",
+          "canonicalTitle": "same as title unless you must preserve a display nuance",
+          "searchName": "ENGLISH canonical search query for geocoding, include city in English, e.g. 'Louvre Museum Paris France' or 'Eiffel Tower Paris' or 'Notre-Dame Cathedral Paris'",
           "category": "attraction|restaurant|hotel|transport|shopping|other",
           "timeBucket": "morning|noon|afternoon|evening|night|null",
           "startTime": "HH:MM or null",
           "endTime": "HH:MM or null",
           "notes": "any tips, costs, or details mentioned for this place",
           "cost": null,
-          "currency": "EUR"
+          "currency": "EUR",
+          "needsSplit": false,
+          "splitActivities": []
         }
       ],
       "notes": "general notes for this day"
@@ -114,6 +214,11 @@ Rules:
 - category MUST be one of: attraction, restaurant, hotel, transport, shopping, other
 - Activities MUST be in chronological order within each day
 - searchName MUST be in English and include the city name for accurate geocoding
+- title and canonicalTitle MUST use the standard full official/common full name, never a local shorthand when the full name is knowable
+- Keep originalMention as the original shorthand or wording from the source text when useful
+- If the source uses a shorthand or alias such as '国博', '鸟巢', '水立方', '故宫', expand it to the canonical full place name in title/canonicalTitle
+- If the source mentions a compound shorthand that refers to multiple places, such as '清北', '鸟巢水立方', or similar bundled mentions, set needsSplit=true and put multiple fully-formed activities into splitActivities; do not keep the bundled shorthand as a single final place
+- When needsSplit=true, the parent activity is only a container hint and the backend will replace it with splitActivities, so splitActivities must be complete and usable on their own
 - If the text mentions 上午/中午/下午/傍晚/夜晚 or equivalent, fill timeBucket
 - If explicit times like 09:30, 9点半, 14:00-16:00 are present, fill startTime/endTime in 24h HH:MM format
 - If cost is mentioned with a currency symbol, extract both cost and currency
@@ -181,7 +286,7 @@ async def geocode_single_place(
     semaphore: asyncio.Semaphore,
 ) -> TripLocationResponse | None:
     async with semaphore:
-        from app.main import build_queries, rank_and_convert
+        from app.main import rank_and_convert
 
         normalized_category = category if category in ("attraction", "restaurant", "hotel", "transport", "shopping", "other") else "other"
         request = PlaceSearchRequest(
@@ -198,38 +303,42 @@ async def geocode_single_place(
         for query in geocode_query_candidates(search_name, title, destination, country):
             request.query = query
             merged = []
-            for candidate in build_queries(query, request):
-                try:
-                    merged.extend(
-                        await search_nominatim(
-                            client,
-                            candidate,
-                            language,
-                            request.country_filter_code,
-                            request.limit,
-                        )
+            try:
+                merged.extend(
+                    await search_nominatim(
+                        client,
+                        query,
+                        language,
+                        request.country_filter_code,
+                        request.limit,
                     )
-                except Exception as exc:
-                    logger.warning("geocode nominatim failed query=%s error=%r", candidate, exc)
+                )
+            except Exception as exc:
+                logger.warning("geocode nominatim failed query=%s error=%r", query, exc)
 
-                try:
-                    merged.extend(
-                        await search_photon(
-                            client,
-                            candidate,
-                            "en",
-                            request.country_filter_code,
-                            request.limit,
-                        )
+            try:
+                merged.extend(
+                    await search_photon(
+                        client,
+                        query,
+                        "en",
+                        request.country_filter_code,
+                        request.limit,
                     )
-                except Exception as exc:
-                    logger.warning("geocode photon failed query=%s error=%r", candidate, exc)
+                )
+            except Exception as exc:
+                logger.warning("geocode photon failed query=%s error=%r", query, exc)
 
             ranked = rank_and_convert(merged, request)
             if not ranked:
                 continue
 
-            best = select_best_geocode_result(ranked, search_name=search_name, title=title)
+            best = select_best_geocode_result(
+                ranked,
+                search_name=search_name,
+                title=title,
+                category=normalized_category,
+            )
             if best is None:
                 continue
             return TripLocationResponse(
@@ -264,7 +373,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
     resolved_region = ai_output.get("region", resolved_destination)
     resolved_country = ai_output.get("country", "")
     resolved_country_code = ai_output.get("countryCode", "")
-    day_plans_raw = ai_output.get("dayPlans", [])
+    day_plans_raw = normalize_day_plans_raw(ai_output.get("dayPlans", []))
     warnings: list[str] = []
 
     # Collect all places that need geocoding
@@ -276,7 +385,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
             search_name = act.get("searchName") or act.get("title", "")
             category = act.get("category", "other")
             if search_name:
-                geocode_tasks.append((search_name, act.get("title", ""), category))
+                geocode_tasks.append((search_name, standardized_activity_title(act), act.get("originalMention", ""), category))
                 task_indices.append((day_idx, act_idx))
 
     # Geocode all places concurrently
@@ -289,7 +398,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
             geocode_single_place(
                 client,
                 search_name=name,
-                title=title,
+                title=title or original_mention,
                 destination=resolved_destination,
                 region=resolved_region,
                 country=resolved_country,
@@ -298,7 +407,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
                 language=language,
                 semaphore=semaphore,
             )
-            for name, title, cat in geocode_tasks
+            for name, title, original_mention, cat in geocode_tasks
         ]
         locations = await asyncio.gather(*coros, return_exceptions=True)
 
@@ -409,6 +518,83 @@ def build_destination_context(
     return DestinationContext(trip_id="ai-itinerary-import", destinations=seeds)
 
 
+def normalize_day_plans_raw(day_plans_raw: list[dict]) -> list[dict]:
+    normalized_days: list[dict] = []
+    for day in day_plans_raw:
+        normalized_day = dict(day)
+        activities = day.get("activities", [])
+        normalized_activities: list[dict] = []
+        for activity in activities:
+            normalized_activities.extend(normalize_activity_dict(activity))
+        normalized_day["activities"] = normalized_activities
+        normalized_days.append(normalized_day)
+    return normalized_days
+
+
+def normalize_activity_dict(activity: dict) -> list[dict]:
+    if activity.get("needsSplit") and isinstance(activity.get("splitActivities"), list):
+        split_activities: list[dict] = []
+        for split_activity in activity.get("splitActivities", []):
+            split_activities.extend(normalize_activity_dict(merged_activity_payload(activity, split_activity)))
+        if split_activities:
+            return split_activities
+
+    title = standardized_activity_title(activity)
+    rule = canonical_activity_rule(title)
+    if rule is None:
+        normalized = dict(activity)
+        normalized["title"] = title or str(activity.get("title") or "").strip()
+        if title and not normalized.get("canonicalTitle"):
+            normalized["canonicalTitle"] = title
+        return [normalized]
+
+    if "split" in rule:
+        split_activities: list[dict] = []
+        for split_entry in rule["split"]:
+            normalized = dict(activity)
+            normalized["title"] = split_entry["title"]
+            normalized["canonicalTitle"] = split_entry["title"]
+            normalized["searchName"] = split_entry["searchName"]
+            normalized["category"] = split_entry.get("category", activity.get("category", "other"))
+            split_activities.append(normalized)
+        return split_activities
+
+    normalized = dict(activity)
+    normalized["title"] = rule["title"]
+    normalized["canonicalTitle"] = rule["title"]
+    normalized["searchName"] = rule["search_name"]
+    return [normalized]
+
+
+def merged_activity_payload(parent: dict, child: dict) -> dict:
+    merged = dict(parent)
+    merged.update(child)
+    merged.pop("splitActivities", None)
+    merged["needsSplit"] = False
+    if parent.get("originalMention") and not merged.get("originalMention"):
+        merged["originalMention"] = parent.get("originalMention")
+    return merged
+
+
+def standardized_activity_title(activity: dict) -> str:
+    for key in ("canonicalTitle", "title"):
+        value = str(activity.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def canonical_activity_rule(title: str) -> dict | None:
+    normalized_title = compact_match_key(title)
+    if not normalized_title:
+        return None
+
+    for key, rule in CANONICAL_ACTIVITY_RULES.items():
+        if compact_match_key(key) == normalized_title:
+            return rule
+    return None
+
+
 def geocode_query_candidates(
     search_name: str,
     title: str,
@@ -467,12 +653,13 @@ def rewritten_landmark_queries(value: str) -> tuple[str, ...]:
     return LANDMARK_QUERY_REWRITES.get(key, ())
 
 
-def select_best_geocode_result(ranked: list, search_name: str, title: str):
+def select_best_geocode_result(ranked: list, search_name: str, title: str, category: str = "other"):
     strict_hints = landmark_name_hints(search_name, title)
-    if not strict_hints:
-        return ranked[0] if ranked else None
-
     for item in ranked:
+        if should_reject_result(item, category):
+            continue
+        if not strict_hints:
+            return item
         if result_matches_hints(item, strict_hints):
             return item
     return None
@@ -512,6 +699,24 @@ def result_matches_hints(item, hints: tuple[str, ...]) -> bool:
             if hint in candidate or candidate in hint:
                 return True
     return False
+
+
+def should_reject_result(item, category: str) -> bool:
+    if category != "attraction":
+        return False
+
+    item_text = " ".join(
+        filter(
+            None,
+            [
+                normalize_text_for_match(getattr(item, "name", "") or ""),
+                normalize_text_for_match(getattr(item, "address", "") or ""),
+                normalize_text_for_match(getattr(item, "subtitle", "") or ""),
+                normalize_text_for_match(getattr(item, "place_type", "") or ""),
+            ],
+        )
+    )
+    return any(token in item_text for token in ATTRACTION_RESULT_REJECT_TOKENS)
 
 
 def compact_match_key(value: str | None) -> str:
