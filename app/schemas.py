@@ -111,7 +111,7 @@ class ActivityResponse(BaseModel):
     endTime: str | None = None
     notes: str = ""
     cost: float | None = None
-    currency: str = "CNY"
+    currency: str | None = None
 
 
 class DayPlanResponse(BaseModel):

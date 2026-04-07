@@ -462,7 +462,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
                 endTime=normalize_time_value(act.get("endTime")) or infer_time_range(act.get("notes", ""))[1],
                 notes=act.get("notes", ""),
                 cost=act.get("cost"),
-                currency=act.get("currency", "CNY"),
+                currency=act.get("currency"),
             ))
 
         day_plans.append(DayPlanResponse(
