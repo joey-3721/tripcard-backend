@@ -29,6 +29,53 @@ logger = logging.getLogger("tripcard-backend")
 MAX_DAY_OUTLIER_DISTANCE_KM = 120.0
 MAX_TRIP_OUTLIER_DISTANCE_KM = 180.0
 
+LANDMARK_QUERY_REWRITES: dict[str, tuple[str, ...]] = {
+    "bird s nest": (
+        "National Stadium Beijing China",
+        "国家体育场",
+        "Olympic Green Beijing National Stadium",
+    ),
+    "鸟巢": (
+        "National Stadium Beijing China",
+        "国家体育场",
+    ),
+    "water cube": (
+        "National Aquatics Center Beijing China",
+        "国家游泳中心",
+        "Water Cube Beijing Olympic Park",
+    ),
+    "水立方": (
+        "National Aquatics Center Beijing China",
+        "国家游泳中心",
+    ),
+    "sanlitun": (
+        "Sanlitun Taikoo Li Beijing China",
+        "三里屯太古里",
+        "Sanlitun Beijing China",
+    ),
+    "三里屯": (
+        "Sanlitun Taikoo Li Beijing China",
+        "三里屯太古里",
+    ),
+    "shichahai": (
+        "Shichahai Scenic Area Beijing China",
+        "什刹海风景区",
+        "Shichahai Beijing China",
+    ),
+    "什刹海": (
+        "Shichahai Scenic Area Beijing China",
+        "什刹海风景区",
+    ),
+    "prince gong s mansion": (
+        "Prince Gong Mansion Beijing China",
+        "恭王府",
+    ),
+    "恭王府": (
+        "Prince Gong Mansion Beijing China",
+        "恭王府",
+    ),
+}
+
 SYSTEM_PROMPT = """\
 You are a travel itinerary parser. The user will give you raw travel plan text \
 (possibly in Chinese, English, or mixed). Extract a structured itinerary.
@@ -182,7 +229,9 @@ async def geocode_single_place(
             if not ranked:
                 continue
 
-            best = ranked[0]
+            best = select_best_geocode_result(ranked, search_name=search_name, title=title)
+            if best is None:
+                continue
             return TripLocationResponse(
                 name=best.name,
                 address=best.address or "",
@@ -366,16 +415,19 @@ def geocode_query_candidates(
     destination: str | None,
     country: str | None,
 ) -> list[str]:
-    candidates = [search_name, title]
-    for value in [search_name, title]:
-        simplified = simplify_activity_query(value)
-        if not simplified:
-            continue
-        candidates.append(simplified)
+    candidates: list[str] = []
+    candidates.extend(rewritten_landmark_queries(search_name))
+    candidates.extend(rewritten_landmark_queries(title))
+    candidates.extend([search_name, title])
+
+    simplified = simplify_activity_query(search_name) or simplify_activity_query(title)
+    if simplified:
         if destination:
             candidates.append(f"{simplified} {destination}")
-        if country:
-            candidates.append(f"{simplified} {country}")
+        else:
+            candidates.append(simplified)
+        if country and destination:
+            candidates.append(f"{simplified} {destination} {country}")
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -388,6 +440,8 @@ def geocode_query_candidates(
             continue
         seen.add(normalized)
         deduped.append(trimmed)
+        if len(deduped) >= 4:
+            break
     return deduped
 
 
@@ -404,6 +458,69 @@ def simplify_activity_query(value: str) -> str:
     )
     simplified = re.sub(r"\s+", " ", simplified).strip(" ,-/")
     return simplified
+
+
+def rewritten_landmark_queries(value: str) -> tuple[str, ...]:
+    key = compact_match_key(value)
+    if not key:
+        return ()
+    return LANDMARK_QUERY_REWRITES.get(key, ())
+
+
+def select_best_geocode_result(ranked: list, search_name: str, title: str):
+    strict_hints = landmark_name_hints(search_name, title)
+    if not strict_hints:
+        return ranked[0] if ranked else None
+
+    for item in ranked:
+        if result_matches_hints(item, strict_hints):
+            return item
+    return None
+
+
+def landmark_name_hints(search_name: str, title: str) -> tuple[str, ...]:
+    hints: list[str] = []
+    for value in [search_name, title]:
+        for rewritten in rewritten_landmark_queries(value):
+            hints.append(rewritten)
+        hints.append(value)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for hint in hints:
+        normalized = compact_match_key(hint)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return tuple(deduped)
+
+
+def result_matches_hints(item, hints: tuple[str, ...]) -> bool:
+    candidate_texts = [
+        compact_match_key(item.name),
+        compact_match_key(item.address or ""),
+        compact_match_key(item.subtitle or ""),
+        compact_match_key(item.locality or ""),
+    ]
+    candidate_texts = [text for text in candidate_texts if text]
+    if not candidate_texts:
+        return False
+
+    for hint in hints:
+        for candidate in candidate_texts:
+            if hint in candidate or candidate in hint:
+                return True
+    return False
+
+
+def compact_match_key(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = normalize_text_for_match(str(value))
+    normalized = normalized.replace("'", " ")
+    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", " ", normalized)
+    return "".join(normalized.split())
 
 
 def prune_far_outlier_locations(
@@ -565,7 +682,11 @@ def same_locality(left: str, right: str) -> bool:
 def normalized_locality_key(value: str | None) -> str:
     if not value:
         return ""
-    return re.sub(r"\s+", "", str(value).strip().lower())
+    return re.sub(r"\s+", "", normalize_text_for_match(str(value)))
+
+
+def normalize_text_for_match(value: str) -> str:
+    return str(value or "").strip().lower()
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
