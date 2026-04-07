@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -74,7 +75,7 @@ async def call_deepseek(text: str, destination: str | None, token_info: dict) ->
     payload = {
         "model": token_info["model"],
         "temperature": 0.1,
-        "max_tokens": 4096,
+        "max_tokens": 2048,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -141,7 +142,15 @@ async def geocode_single_place(
 async def parse_itinerary(text: str, destination: str | None, language: str) -> ParseItineraryResponse:
     token_info = get_ai_token("deepseek")
 
-    ai_output = await call_deepseek(text, destination, token_info)
+    # Check DeepSeek output cache first
+    cache_key = hashlib.sha256(
+        json.dumps({"text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+    db = MySQLCache()
+    ai_output = db.get_ai_cache(cache_key)
+    if ai_output is None:
+        ai_output = await call_deepseek(text, destination, token_info)
+        db.set_ai_cache(cache_key, ai_output)
 
     resolved_destination = ai_output.get("destination", destination or "")
     day_plans_raw = ai_output.get("dayPlans", [])

@@ -39,6 +39,7 @@ async def lifespan(_: FastAPI):
         cache.ensure_table()
         cache.cleanup()
     db.ensure_ai_tokens_table()
+    db.ensure_ai_parse_cache_table()
     yield
 
 

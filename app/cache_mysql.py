@@ -110,3 +110,41 @@ class MySQLCache:
                     (provider,),
                 )
                 return cur.fetchone()
+
+    def get_ai_cache(self, cache_key: str) -> dict | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT payload FROM `ai_parse_cache` "
+                    "WHERE cache_key = %s AND expires_at > NOW() LIMIT 1",
+                    (cache_key,),
+                )
+                row = cur.fetchone()
+                return json.loads(row["payload"]) if row else None
+
+    def set_ai_cache(self, cache_key: str, payload: dict, ttl_seconds: int = 86400 * 7) -> None:
+        expires_at = int(time.time()) + ttl_seconds
+        encoded = json.dumps(payload, ensure_ascii=False)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO `ai_parse_cache` (cache_key, payload, expires_at) "
+                    "VALUES (%s, %s, FROM_UNIXTIME(%s)) "
+                    "ON DUPLICATE KEY UPDATE payload=VALUES(payload), expires_at=VALUES(expires_at), created_at=CURRENT_TIMESTAMP",
+                    (cache_key, encoded, expires_at),
+                )
+
+    def ensure_ai_parse_cache_table(self) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS `ai_parse_cache` (
+                        cache_key VARCHAR(64) PRIMARY KEY,
+                        payload   LONGTEXT NOT NULL,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        expires_at DATETIME NOT NULL,
+                        INDEX idx_expires_at (expires_at)
+                    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                    """
+                )
