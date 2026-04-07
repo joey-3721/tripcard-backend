@@ -299,6 +299,16 @@ async def geocode_single_place(
         from app.main import rank_and_convert
 
         normalized_category = category if category in ("attraction", "restaurant", "hotel", "transport", "shopping", "other") else "other"
+        logger.info(
+            "ai geocode start title=%s search=%s category=%s destination=%s region=%s country=%s country_code=%s",
+            title,
+            search_name,
+            normalized_category,
+            destination or "",
+            region or "",
+            country or "",
+            country_code or "",
+        )
         request = PlaceSearchRequest(
             query=search_name,
             category=normalized_category,
@@ -340,6 +350,13 @@ async def geocode_single_place(
                 logger.warning("geocode photon failed query=%s error=%r", query, exc)
 
             ranked = rank_and_convert(merged, request)
+            logger.info(
+                "ai geocode candidates title=%s query=%s total=%s top=%s",
+                title,
+                query,
+                len(ranked),
+                summarize_ranked_candidates(ranked),
+            )
             if not ranked:
                 continue
 
@@ -350,7 +367,18 @@ async def geocode_single_place(
                 category=normalized_category,
             )
             if best is None:
+                logger.info("ai geocode no-match title=%s query=%s", title, query)
                 continue
+            logger.info(
+                "ai geocode selected title=%s query=%s selected=%s locality=%s country_code=%s score=%s matched_by=%s",
+                title,
+                query,
+                best.name,
+                best.locality or "",
+                best.country_code or "",
+                getattr(best, "score", None),
+                getattr(best, "matched_by", []),
+            )
             return TripLocationResponse(
                 name=best.name,
                 address=best.address or "",
@@ -363,6 +391,7 @@ async def geocode_single_place(
                 category=normalized_category,
             )
 
+        logger.info("ai geocode unresolved title=%s search=%s", title, search_name)
         return None
 
 
@@ -371,18 +400,21 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
 
     # Check DeepSeek output cache first
     cache_key = hashlib.sha256(
-        json.dumps({"cache_version": 3, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
+        json.dumps({"cache_version": 4, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
     ).hexdigest()
     db = MySQLCache()
     ai_output = db.get_ai_cache(cache_key)
     if ai_output is None:
         ai_output = await call_deepseek(text, destination, token_info)
         db.set_ai_cache(cache_key, ai_output)
+        logger.info("ai parse cache miss destination=%s", destination or "")
+    else:
+        logger.info("ai parse cache hit destination=%s", destination or "")
 
     resolved_destination = ai_output.get("destination", destination or "")
     resolved_region = ai_output.get("region", resolved_destination)
     resolved_country = ai_output.get("country", "")
-    resolved_country_code = ai_output.get("countryCode", "")
+    resolved_country_code = normalize_country_code(ai_output.get("countryCode", ""))
     day_plans_raw = normalize_day_plans_raw(ai_output.get("dayPlans", []))
     warnings: list[str] = []
 
@@ -404,6 +436,29 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
     timeout = httpx.Timeout(settings.request_timeout_seconds)
 
     async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
+        if not resolved_country_code:
+            resolved_country_code = await infer_country_code(
+                client,
+                language=language,
+                country=resolved_country,
+                destination=resolved_destination,
+                region=resolved_region,
+            )
+            logger.info(
+                "ai parse inferred country_code=%s from country=%s destination=%s region=%s",
+                resolved_country_code,
+                resolved_country,
+                resolved_destination,
+                resolved_region,
+            )
+        else:
+            logger.info(
+                "ai parse using ai country_code=%s destination=%s region=%s country=%s",
+                resolved_country_code,
+                resolved_destination,
+                resolved_region,
+                resolved_country,
+            )
         coros = [
             geocode_single_place(
                 client,
@@ -498,6 +553,48 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
         rawAiOutput=ai_output,
         warnings=warnings,
     )
+
+
+async def infer_country_code(
+    client: httpx.AsyncClient,
+    language: str,
+    country: str,
+    destination: str,
+    region: str,
+) -> str:
+    candidates: list[str] = []
+    for raw in (country, destination, region):
+        trimmed = str(raw or "").strip()
+        if trimmed and trimmed not in candidates:
+            candidates.append(trimmed)
+
+    for query in candidates[:3]:
+        code = await infer_country_code_for_query(client, query=query, language=language)
+        if code:
+            return code
+    return ""
+
+
+async def infer_country_code_for_query(
+    client: httpx.AsyncClient,
+    query: str,
+    language: str,
+) -> str:
+    for provider in ("nominatim", "photon"):
+        try:
+            if provider == "nominatim":
+                items = await search_nominatim(client, query, language, None, 3)
+            else:
+                items = await search_photon(client, query, "en", None, 3)
+        except Exception as exc:
+            logger.warning("country code inference failed provider=%s query=%s error=%r", provider, query, exc)
+            continue
+
+        for item in items:
+            code = normalize_country_code(getattr(item, "country_code", ""))
+            if code:
+                return code
+    return ""
 
 
 def build_destination_context(
@@ -667,15 +764,19 @@ def select_best_geocode_result(ranked: list, search_name: str, title: str, categ
     strict_hints = landmark_name_hints(search_name, title)
     for item in ranked:
         if should_reject_result(item, category):
+            logger.info("ai geocode reject title=%s candidate=%s reason=token_reject", title, item.name)
             continue
         if has_strict_identity_requirement(search_name, title, category) and not matches_strict_identity(item, search_name, title):
+            logger.info("ai geocode reject title=%s candidate=%s reason=strict_identity_mismatch", title, item.name)
             continue
         if not strict_hints:
             if is_reasonably_confident_result(item, category):
                 return item
+            logger.info("ai geocode reject title=%s candidate=%s reason=low_confidence_no_hints", title, item.name)
             continue
         if result_matches_hints(item, strict_hints):
             return item
+        logger.info("ai geocode reject title=%s candidate=%s reason=hint_mismatch", title, item.name)
     if category != "attraction":
         return None
     for item in ranked:
@@ -684,6 +785,7 @@ def select_best_geocode_result(ranked: list, search_name: str, title: str, categ
         if has_strict_identity_requirement(search_name, title, category) and not matches_strict_identity(item, search_name, title):
             continue
         if is_reasonably_confident_result(item, category):
+            logger.info("ai geocode fallback-select title=%s candidate=%s", title, item.name)
             return item
     return None
 
@@ -786,6 +888,22 @@ def compact_match_key(value: str | None) -> str:
     return "".join(normalized.split())
 
 
+def summarize_ranked_candidates(ranked: list, limit: int = 3) -> list[str]:
+    summary: list[str] = []
+    for item in ranked[:limit]:
+        summary.append(
+            "|".join(
+                [
+                    getattr(item, "name", "") or "",
+                    getattr(item, "locality", "") or "",
+                    getattr(item, "country_code", "") or "",
+                    str(getattr(item, "score", "") or ""),
+                ]
+            )
+        )
+    return summary
+
+
 def prune_far_outlier_locations(
     day_plans_raw: list[dict],
     location_map: dict[tuple[int, int], TripLocationResponse | None],
@@ -838,6 +956,16 @@ def prune_far_outlier_locations(
 
             if not same_trip_country or is_far_from_day_cluster or is_far_from_trip_cluster:
                 title = day.get("activities", [])[act_idx].get("title", "") or location.name
+                logger.info(
+                    "ai geocode prune title=%s locality=%s country_code=%s day_distance_km=%.1f trip_distance_km=%s same_day_locality=%s expected_country_code=%s",
+                    title,
+                    location.locality or "",
+                    location.countryCode or "",
+                    day_distance_km,
+                    f"{trip_distance_km:.1f}" if trip_distance_km is not None else "n/a",
+                    same_day_locality,
+                    resolved_country_code,
+                )
                 warnings.append(
                     f"Removed outlier location: {title} ({location.locality or location.country or 'unknown'})"
                 )
@@ -946,6 +1074,10 @@ def normalized_locality_key(value: str | None) -> str:
     if not value:
         return ""
     return re.sub(r"\s+", "", normalize_text_for_match(str(value)))
+
+
+def normalize_country_code(value: str | None) -> str:
+    return str(value or "").strip().upper()
 
 
 def normalize_text_for_match(value: str) -> str:
