@@ -16,6 +16,7 @@ from app.schemas import (
     ActivityResponse,
     DayPlanResponse,
     ParseItineraryResponse,
+    ParseItinerarySummaryResponse,
     TripLocationResponse,
 )
 
@@ -28,7 +29,10 @@ You are a travel itinerary parser. The user will give you raw travel plan text \
 Return ONLY valid JSON, no markdown fences, no explanation. The JSON schema:
 
 {
+  "title": "string - concise trip card title in the original language, e.g. '巴黎48小时深度玩'",
   "destination": "string - primary destination city/region name in the original language",
+  "country": "string - country name in the original language if confidently known, else empty string",
+  "region": "string - city or region name in the original language if confidently known, else same as destination or empty string",
   "totalDays": number,
   "dayPlans": [
     {
@@ -49,6 +53,7 @@ Return ONLY valid JSON, no markdown fences, no explanation. The JSON schema:
 }
 
 Rules:
+- title should be short and suitable for a trip card
 - category MUST be one of: attraction, restaurant, hotel, transport, shopping, other
 - Activities MUST be in chronological order within each day
 - searchName MUST be in English and include the city name for accurate geocoding
@@ -135,6 +140,9 @@ async def geocode_single_place(
             latitude=best.latitude,
             longitude=best.longitude,
             placeID=best.provider_place_id,
+            country=best.country or "",
+            countryCode=best.country_code or "",
+            locality=best.locality or "",
             category=category if category in ("attraction", "restaurant", "hotel", "transport", "shopping", "other") else "other",
         )
 
@@ -195,6 +203,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
 
     # Build response
     day_plans: list[DayPlanResponse] = []
+    geocoded_locations: list[TripLocationResponse] = []
     for day_idx, day in enumerate(day_plans_raw):
         activities: list[ActivityResponse] = []
         for act_idx, act in enumerate(day.get("activities", [])):
@@ -203,8 +212,13 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
             if location is None and act.get("title"):
                 location = TripLocationResponse(
                     name=act.get("searchName") or act["title"],
+                    country="",
+                    countryCode="",
+                    locality="",
                     category=act.get("category", "other"),
                 )
+            elif location is not None:
+                geocoded_locations.append(location)
 
             activities.append(ActivityResponse(
                 id=str(uuid.uuid4()),
@@ -223,10 +237,73 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
             notes=day.get("notes", ""),
         ))
 
+    total_days = ai_output.get("totalDays", len(day_plans))
+    summary = build_summary(
+        ai_output=ai_output,
+        resolved_destination=resolved_destination,
+        total_days=total_days,
+        geocoded_locations=geocoded_locations,
+    )
+
     return ParseItineraryResponse(
         destination=resolved_destination,
-        totalDays=ai_output.get("totalDays", len(day_plans)),
+        totalDays=total_days,
+        summary=summary,
         dayPlans=day_plans,
         rawAiOutput=ai_output,
         warnings=warnings,
     )
+
+
+def build_summary(
+    ai_output: dict,
+    resolved_destination: str,
+    total_days: int,
+    geocoded_locations: list[TripLocationResponse],
+) -> ParseItinerarySummaryResponse:
+    title = str(ai_output.get("title") or "").strip()
+    country = str(ai_output.get("country") or "").strip()
+    region = str(ai_output.get("region") or "").strip()
+
+    country_code_votes: dict[str, int] = {}
+    country_name_votes: dict[str, int] = {}
+    locality_votes: dict[str, int] = {}
+
+    for location in geocoded_locations:
+        if location.countryCode:
+            country_code_votes[location.countryCode] = country_code_votes.get(location.countryCode, 0) + 1
+        if location.country:
+            country_name_votes[location.country] = country_name_votes.get(location.country, 0) + 1
+        if location.locality:
+            locality_votes[location.locality] = locality_votes.get(location.locality, 0) + 1
+        if location.address:
+            address_parts = [part.strip() for part in location.address.split(",") if part.strip()]
+            if address_parts and not country:
+                country_name_votes[address_parts[-1]] = country_name_votes.get(address_parts[-1], 0) + 1
+
+    inferred_country = most_common_value(country_name_votes)
+    inferred_country_code = most_common_value(country_code_votes)
+    inferred_region = most_common_value(locality_votes)
+
+    if not country:
+        country = inferred_country or ""
+    if not region:
+        region = inferred_region or resolved_destination
+    if not title:
+        duration_suffix = f"{total_days}天行程" if total_days > 0 else "行程"
+        title = f"{resolved_destination}{duration_suffix}" if resolved_destination else duration_suffix
+
+    return ParseItinerarySummaryResponse(
+        title=title,
+        destination=resolved_destination,
+        country=country,
+        countryCode=inferred_country_code or "",
+        region=region,
+        totalDays=total_days,
+    )
+
+
+def most_common_value(counts: dict[str, int]) -> str | None:
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda item: (item[1], item[0]))[0]

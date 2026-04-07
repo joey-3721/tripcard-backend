@@ -92,6 +92,9 @@ class TripLocationResponse(BaseModel):
     latitude: float = 0.0
     longitude: float = 0.0
     placeID: str | None = None
+    country: str = ""
+    countryCode: str = ""
+    locality: str = ""
     category: ActivityCategoryType = "other"
 
 
@@ -115,9 +118,19 @@ class DayPlanResponse(BaseModel):
     notes: str = ""
 
 
+class ParseItinerarySummaryResponse(BaseModel):
+    title: str = ""
+    destination: str = ""
+    country: str = ""
+    countryCode: str = ""
+    region: str = ""
+    totalDays: int = 0
+
+
 class ParseItineraryResponse(BaseModel):
     destination: str
     totalDays: int
+    summary: ParseItinerarySummaryResponse | None = None
     dayPlans: list[DayPlanResponse]
     rawAiOutput: dict | None = None
     warnings: list[str] = Field(default_factory=list)
