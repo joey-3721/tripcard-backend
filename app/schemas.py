@@ -75,6 +75,9 @@ class PlaceSearchResponse(BaseModel):
 ActivityCategoryType = Literal[
     "attraction", "restaurant", "hotel", "transport", "shopping", "other"
 ]
+ActivityTimeBucketType = Literal[
+    "morning", "noon", "afternoon", "evening", "night"
+]
 
 
 class ParseItineraryRequest(BaseModel):
@@ -103,6 +106,7 @@ class ActivityResponse(BaseModel):
     title: str
     category: ActivityCategoryType = "other"
     location: TripLocationResponse | None = None
+    timeBucket: ActivityTimeBucketType | None = None
     startTime: str | None = None
     endTime: str | None = None
     notes: str = ""

@@ -42,6 +42,9 @@ Return ONLY valid JSON, no markdown fences, no explanation. The JSON schema:
           "title": "place display name in the original language",
           "searchName": "ENGLISH search query for geocoding, include city in English, e.g. 'Louvre Museum Paris France' or 'Eiffel Tower Paris' or 'Notre-Dame Cathedral Paris'",
           "category": "attraction|restaurant|hotel|transport|shopping|other",
+          "timeBucket": "morning|noon|afternoon|evening|night|null",
+          "startTime": "HH:MM or null",
+          "endTime": "HH:MM or null",
           "notes": "any tips, costs, or details mentioned for this place",
           "cost": null,
           "currency": "EUR"
@@ -57,6 +60,8 @@ Rules:
 - category MUST be one of: attraction, restaurant, hotel, transport, shopping, other
 - Activities MUST be in chronological order within each day
 - searchName MUST be in English and include the city name for accurate geocoding
+- If the text mentions 上午/中午/下午/傍晚/夜晚 or equivalent, fill timeBucket
+- If explicit times like 09:30, 9点半, 14:00-16:00 are present, fill startTime/endTime in 24h HH:MM format
 - If cost is mentioned with a currency symbol, extract both cost and currency
 - Do NOT include transport between places as separate activities unless it is a notable activity (e.g. Seine river cruise)
 - Merge nearby/related items into one activity if they are at the same location
@@ -152,7 +157,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
 
     # Check DeepSeek output cache first
     cache_key = hashlib.sha256(
-        json.dumps({"text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
+        json.dumps({"cache_version": 2, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
     ).hexdigest()
     db = MySQLCache()
     ai_output = db.get_ai_cache(cache_key)
@@ -225,6 +230,9 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
                 title=act.get("title", ""),
                 category=act.get("category", "other"),
                 location=location,
+                timeBucket=infer_time_bucket(act),
+                startTime=normalize_time_value(act.get("startTime")) or infer_time_range(act.get("notes", ""))[0],
+                endTime=normalize_time_value(act.get("endTime")) or infer_time_range(act.get("notes", ""))[1],
                 notes=act.get("notes", ""),
                 cost=act.get("cost"),
                 currency=act.get("currency", "CNY"),
@@ -307,3 +315,88 @@ def most_common_value(counts: dict[str, int]) -> str | None:
     if not counts:
         return None
     return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def infer_time_bucket(activity: dict) -> str | None:
+    direct = normalize_time_bucket(activity.get("timeBucket"))
+    if direct:
+        return direct
+
+    texts = [
+        str(activity.get("title") or ""),
+        str(activity.get("notes") or ""),
+    ]
+    for text in texts:
+        bucket = normalize_time_bucket(text)
+        if bucket:
+            return bucket
+    return None
+
+
+def normalize_time_bucket(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    text = str(value).strip().lower()
+    mappings = {
+        "morning": "morning",
+        "上午": "morning",
+        "早上": "morning",
+        "清晨": "morning",
+        "中午": "noon",
+        "noon": "noon",
+        "午间": "noon",
+        "afternoon": "afternoon",
+        "下午": "afternoon",
+        "傍晚": "evening",
+        "evening": "evening",
+        "黄昏": "evening",
+        "night": "night",
+        "夜晚": "night",
+        "晚上": "night",
+        "夜间": "night",
+    }
+    for token, normalized in mappings.items():
+        if token in text:
+            return normalized
+    return None
+
+
+def infer_time_range(text: str) -> tuple[str | None, str | None]:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return None, None
+
+    explicit = [
+        normalize_time_value(match)
+        for match in re.findall(r"(?<!\d)(?:[01]?\d|2[0-3])[:：点时](?:[0-5]\d|半)?", normalized)
+    ]
+    explicit = [item for item in explicit if item]
+    if len(explicit) >= 2:
+        return explicit[0], explicit[1]
+    if len(explicit) == 1:
+        return explicit[0], None
+    return None, None
+
+
+def normalize_time_value(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    match = re.search(r"^(?P<hour>\d{1,2})(?:[:：点时](?P<minute>\d{1,2}|半)?)?$", text)
+    if not match:
+        return None
+
+    hour = int(match.group("hour"))
+    minute_token = match.group("minute")
+    minute = 0
+    if minute_token:
+        minute = 30 if minute_token == "半" else int(minute_token)
+
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
