@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import uuid
 
@@ -11,16 +12,22 @@ import httpx
 
 from app.cache_mysql import MySQLCache
 from app.config import settings
+from app.providers.nominatim import search_nominatim
 from app.providers.photon import search_photon
 from app.schemas import (
     ActivityResponse,
     DayPlanResponse,
+    DestinationContext,
+    DestinationSeed,
     ParseItineraryResponse,
     ParseItinerarySummaryResponse,
+    PlaceSearchRequest,
     TripLocationResponse,
 )
 
 logger = logging.getLogger("tripcard-backend")
+MAX_DAY_OUTLIER_DISTANCE_KM = 120.0
+MAX_TRIP_OUTLIER_DISTANCE_KM = 180.0
 
 SYSTEM_PROMPT = """\
 You are a travel itinerary parser. The user will give you raw travel plan text \
@@ -117,39 +124,78 @@ async def call_deepseek(text: str, destination: str | None, token_info: dict) ->
 async def geocode_single_place(
     client: httpx.AsyncClient,
     search_name: str,
+    title: str,
     destination: str | None,
+    region: str | None,
+    country: str | None,
+    country_code: str | None,
     category: str,
     language: str,
     semaphore: asyncio.Semaphore,
 ) -> TripLocationResponse | None:
     async with semaphore:
-        merged = []
-        try:
-            merged.extend(await search_photon(client, search_name, "en", None, 5))
-        except Exception as exc:
-            logger.warning("geocode photon failed query=%s error=%r", search_name, exc)
+        from app.main import build_queries, rank_and_convert
 
-        if not merged:
-            return None
-
-        # Pick the best result: prefer one whose name contains the search query
-        best = merged[0]
-        for item in merged:
-            if search_name.lower() in (item.name or "").lower():
-                best = item
-                break
-
-        return TripLocationResponse(
-            name=best.name,
-            address=best.address or "",
-            latitude=best.latitude,
-            longitude=best.longitude,
-            placeID=best.provider_place_id,
-            country=best.country or "",
-            countryCode=best.country_code or "",
-            locality=best.locality or "",
-            category=category if category in ("attraction", "restaurant", "hotel", "transport", "shopping", "other") else "other",
+        normalized_category = category if category in ("attraction", "restaurant", "hotel", "transport", "shopping", "other") else "other"
+        request = PlaceSearchRequest(
+            query=search_name,
+            category=normalized_category,
+            scope="all",
+            preferred_country_codes=[country_code] if country_code else [],
+            country_filter_code=country_code or None,
+            destination_context=build_destination_context(destination, region, country, country_code),
+            language=language,
+            limit=5,
         )
+
+        for query in geocode_query_candidates(search_name, title, destination, country):
+            request.query = query
+            merged = []
+            for candidate in build_queries(query, request):
+                try:
+                    merged.extend(
+                        await search_nominatim(
+                            client,
+                            candidate,
+                            language,
+                            request.country_filter_code,
+                            request.limit,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("geocode nominatim failed query=%s error=%r", candidate, exc)
+
+                try:
+                    merged.extend(
+                        await search_photon(
+                            client,
+                            candidate,
+                            "en",
+                            request.country_filter_code,
+                            request.limit,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("geocode photon failed query=%s error=%r", candidate, exc)
+
+            ranked = rank_and_convert(merged, request)
+            if not ranked:
+                continue
+
+            best = ranked[0]
+            return TripLocationResponse(
+                name=best.name,
+                address=best.address or "",
+                latitude=best.coordinate.latitude,
+                longitude=best.coordinate.longitude,
+                placeID=best.provider_place_id,
+                country=best.country or "",
+                countryCode=best.country_code or "",
+                locality=best.locality or "",
+                category=normalized_category,
+            )
+
+        return None
 
 
 async def parse_itinerary(text: str, destination: str | None, language: str) -> ParseItineraryResponse:
@@ -166,6 +212,9 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
         db.set_ai_cache(cache_key, ai_output)
 
     resolved_destination = ai_output.get("destination", destination or "")
+    resolved_region = ai_output.get("region", resolved_destination)
+    resolved_country = ai_output.get("country", "")
+    resolved_country_code = ai_output.get("countryCode", "")
     day_plans_raw = ai_output.get("dayPlans", [])
     warnings: list[str] = []
 
@@ -178,7 +227,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
             search_name = act.get("searchName") or act.get("title", "")
             category = act.get("category", "other")
             if search_name:
-                geocode_tasks.append((search_name, category))
+                geocode_tasks.append((search_name, act.get("title", ""), category))
                 task_indices.append((day_idx, act_idx))
 
     # Geocode all places concurrently
@@ -188,8 +237,19 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
 
     async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
         coros = [
-            geocode_single_place(client, name, resolved_destination, cat, language, semaphore)
-            for name, cat in geocode_tasks
+            geocode_single_place(
+                client,
+                search_name=name,
+                title=title,
+                destination=resolved_destination,
+                region=resolved_region,
+                country=resolved_country,
+                country_code=resolved_country_code,
+                category=cat,
+                language=language,
+                semaphore=semaphore,
+            )
+            for name, title, cat in geocode_tasks
         ]
         locations = await asyncio.gather(*coros, return_exceptions=True)
 
@@ -205,6 +265,15 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
             location_map[(day_idx, act_idx)] = loc
             if loc is None:
                 warnings.append(f"No location found: {geocode_tasks[idx][0]}")
+
+    prune_far_outlier_locations(
+        day_plans_raw=day_plans_raw,
+        location_map=location_map,
+        resolved_destination=resolved_destination,
+        resolved_region=resolved_region,
+        resolved_country_code=resolved_country_code,
+        warnings=warnings,
+    )
 
     # Build response
     day_plans: list[DayPlanResponse] = []
@@ -261,6 +330,258 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
         rawAiOutput=ai_output,
         warnings=warnings,
     )
+
+
+def build_destination_context(
+    destination: str | None,
+    region: str | None,
+    country: str | None,
+    country_code: str | None,
+) -> DestinationContext | None:
+    normalized_country = (country or "").strip()
+    normalized_country_code = (country_code or "").strip().upper()
+    seeds: list[DestinationSeed] = []
+
+    for name in [destination, region]:
+        trimmed = (name or "").strip()
+        if not trimmed:
+            continue
+        seed = DestinationSeed(
+            name=trimmed,
+            country=normalized_country or trimmed,
+            country_code=normalized_country_code,
+        )
+        if seed not in seeds:
+            seeds.append(seed)
+
+    if not seeds:
+        return None
+
+    return DestinationContext(trip_id="ai-itinerary-import", destinations=seeds)
+
+
+def geocode_query_candidates(
+    search_name: str,
+    title: str,
+    destination: str | None,
+    country: str | None,
+) -> list[str]:
+    candidates = [search_name, title]
+    for value in [search_name, title]:
+        simplified = simplify_activity_query(value)
+        if not simplified:
+            continue
+        candidates.append(simplified)
+        if destination:
+            candidates.append(f"{simplified} {destination}")
+        if country:
+            candidates.append(f"{simplified} {country}")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        trimmed = " ".join((item or "").split())
+        if not trimmed:
+            continue
+        normalized = trimmed.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(trimmed)
+    return deduped
+
+
+def simplify_activity_query(value: str) -> str:
+    if not value:
+        return ""
+
+    simplified = re.sub(r"\([^)]*\)", " ", value)
+    simplified = re.sub(
+        r"\b(river cruise|cruise|boat tour|boat trip|boat ride|sightseeing tour|walking tour|night tour|tour)\b",
+        " ",
+        simplified,
+        flags=re.IGNORECASE,
+    )
+    simplified = re.sub(r"\s+", " ", simplified).strip(" ,-/")
+    return simplified
+
+
+def prune_far_outlier_locations(
+    day_plans_raw: list[dict],
+    location_map: dict[tuple[int, int], TripLocationResponse | None],
+    resolved_destination: str,
+    resolved_region: str,
+    resolved_country_code: str,
+    warnings: list[str],
+) -> None:
+    trip_reference = trip_reference_location(list(location_map.values()))
+
+    for day_idx, day in enumerate(day_plans_raw):
+        day_entries: list[tuple[int, TripLocationResponse]] = []
+        for act_idx, _ in enumerate(day.get("activities", [])):
+            location = location_map.get((day_idx, act_idx))
+            if is_usable_location(location):
+                day_entries.append((act_idx, location))
+
+        if len(day_entries) < 2:
+            continue
+
+        day_reference = dominant_day_reference(
+            [location for _, location in day_entries],
+            resolved_destination=resolved_destination,
+            resolved_region=resolved_region,
+            resolved_country_code=resolved_country_code,
+        )
+        if day_reference is None:
+            continue
+
+        for act_idx, location in day_entries:
+            day_distance_km = haversine_km(
+                location.latitude,
+                location.longitude,
+                day_reference.latitude,
+                day_reference.longitude,
+            )
+            trip_distance_km = None
+            if trip_reference is not None:
+                trip_distance_km = haversine_km(
+                    location.latitude,
+                    location.longitude,
+                    trip_reference.latitude,
+                    trip_reference.longitude,
+                )
+
+            same_day_locality = same_locality(location.locality, day_reference.locality)
+            same_trip_country = not resolved_country_code or location.countryCode.upper() == resolved_country_code.upper()
+            is_far_from_day_cluster = day_distance_km > MAX_DAY_OUTLIER_DISTANCE_KM and not same_day_locality
+            is_far_from_trip_cluster = trip_distance_km is not None and trip_distance_km > MAX_TRIP_OUTLIER_DISTANCE_KM
+
+            if not same_trip_country or is_far_from_day_cluster or is_far_from_trip_cluster:
+                title = day.get("activities", [])[act_idx].get("title", "") or location.name
+                warnings.append(
+                    f"Removed outlier location: {title} ({location.locality or location.country or 'unknown'})"
+                )
+                location_map[(day_idx, act_idx)] = None
+
+
+def dominant_day_reference(
+    locations: list[TripLocationResponse],
+    resolved_destination: str,
+    resolved_region: str,
+    resolved_country_code: str,
+) -> TripLocationResponse | None:
+    if not locations:
+        return None
+
+    locality_votes: dict[str, int] = {}
+    for location in locations:
+        locality = normalized_locality_key(location.locality)
+        if locality:
+            locality_votes[locality] = locality_votes.get(locality, 0) + 1
+
+    preferred_keys = {
+        normalized_locality_key(resolved_destination),
+        normalized_locality_key(resolved_region),
+    } - {""}
+
+    dominant_key = ""
+    if locality_votes:
+        dominant_key = max(
+            locality_votes.items(),
+            key=lambda item: (
+                item[1],
+                1 if item[0] in preferred_keys else 0,
+                item[0],
+            ),
+        )[0]
+
+    cluster = [
+        location for location in locations
+        if not dominant_key or normalized_locality_key(location.locality) == dominant_key
+    ]
+    if not cluster:
+        cluster = locations
+
+    if resolved_country_code:
+        same_country_cluster = [
+            location for location in cluster
+            if location.countryCode.upper() == resolved_country_code.upper()
+        ]
+        if same_country_cluster:
+            cluster = same_country_cluster
+
+    return centroid_location(cluster)
+
+
+def trip_reference_location(locations: list[TripLocationResponse | None]) -> TripLocationResponse | None:
+    usable = [location for location in locations if is_usable_location(location)]
+    if len(usable) < 2:
+        return None
+    return centroid_location(usable)
+
+
+def centroid_location(locations: list[TripLocationResponse]) -> TripLocationResponse | None:
+    if not locations:
+        return None
+
+    latitude = sum(location.latitude for location in locations) / len(locations)
+    longitude = sum(location.longitude for location in locations) / len(locations)
+    locality = most_common_value({
+        key: sum(1 for location in locations if normalized_locality_key(location.locality) == key)
+        for key in {normalized_locality_key(location.locality) for location in locations if normalized_locality_key(location.locality)}
+    }) or ""
+    country = most_common_value({
+        location.country: sum(1 for item in locations if item.country == location.country)
+        for location in locations if location.country
+    }) or ""
+    country_code = most_common_value({
+        location.countryCode: sum(1 for item in locations if item.countryCode == location.countryCode)
+        for location in locations if location.countryCode
+    }) or ""
+
+    return TripLocationResponse(
+        name="cluster-center",
+        address="",
+        latitude=latitude,
+        longitude=longitude,
+        placeID=None,
+        country=country,
+        countryCode=country_code,
+        locality=locality,
+        category="other",
+    )
+
+
+def is_usable_location(location: TripLocationResponse | None) -> bool:
+    return bool(location) and (location.latitude != 0.0 or location.longitude != 0.0)
+
+
+def same_locality(left: str, right: str) -> bool:
+    left_key = normalized_locality_key(left)
+    right_key = normalized_locality_key(right)
+    return bool(left_key) and left_key == right_key
+
+
+def normalized_locality_key(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", "", str(value).strip().lower())
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_km = 6371.0
+    lat1_rad = math.radians(lat1)
+    lon1_rad = math.radians(lon1)
+    lat2_rad = math.radians(lat2)
+    lon2_rad = math.radians(lon2)
+
+    delta_lat = lat2_rad - lat1_rad
+    delta_lon = lon2_rad - lon1_rad
+    a = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon / 2) ** 2
+    )
+    return radius_km * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def build_summary(
