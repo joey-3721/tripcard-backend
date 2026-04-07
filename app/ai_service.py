@@ -27,8 +27,8 @@ from app.schemas import (
 )
 
 logger = logging.getLogger("tripcard-backend")
-MAX_DAY_OUTLIER_DISTANCE_KM = 120.0
-MAX_TRIP_OUTLIER_DISTANCE_KM = 180.0
+MAX_DAY_OUTLIER_DISTANCE_KM = 220.0
+MAX_DAY_CITY_MISMATCH_DISTANCE_KM = 60.0
 MIN_ATTRACTION_CONFIDENCE_SCORE = 0.72
 STRICT_IDENTITY_KEYWORDS = (
     "university",
@@ -401,7 +401,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
 
     # Check DeepSeek output cache first
     cache_key = hashlib.sha256(
-        json.dumps({"cache_version": 4, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
+        json.dumps({"cache_version": 7, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
     ).hexdigest()
     db = MySQLCache()
     ai_output = db.get_ai_cache(cache_key)
@@ -971,8 +971,6 @@ def prune_far_outlier_locations(
     resolved_country_code: str,
     warnings: list[str],
 ) -> None:
-    trip_reference = trip_reference_location(list(location_map.values()))
-
     for day_idx, day in enumerate(day_plans_raw):
         day_entries: list[tuple[int, TripLocationResponse]] = []
         for act_idx, _ in enumerate(day.get("activities", [])):
@@ -991,6 +989,11 @@ def prune_far_outlier_locations(
         )
         if day_reference is None:
             continue
+        dominant_locality_key, dominant_locality_votes = dominant_day_locality_key(
+            [location for _, location in day_entries],
+            resolved_destination=resolved_destination,
+            resolved_region=resolved_region,
+        )
 
         for act_idx, location in day_entries:
             day_distance_km = haversine_km(
@@ -999,30 +1002,27 @@ def prune_far_outlier_locations(
                 day_reference.latitude,
                 day_reference.longitude,
             )
-            trip_distance_km = None
-            if trip_reference is not None:
-                trip_distance_km = haversine_km(
-                    location.latitude,
-                    location.longitude,
-                    trip_reference.latitude,
-                    trip_reference.longitude,
-                )
-
             same_day_locality = same_locality(location.locality, day_reference.locality)
             same_trip_country = not resolved_country_code or location.countryCode.upper() == resolved_country_code.upper()
             is_far_from_day_cluster = day_distance_km > MAX_DAY_OUTLIER_DISTANCE_KM and not same_day_locality
-            is_far_from_trip_cluster = trip_distance_km is not None and trip_distance_km > MAX_TRIP_OUTLIER_DISTANCE_KM
+            has_strong_day_city = dominant_locality_votes >= 2 and bool(dominant_locality_key)
+            is_far_from_day_city = (
+                has_strong_day_city
+                and normalized_locality_key(location.locality) != dominant_locality_key
+                and day_distance_km > MAX_DAY_CITY_MISMATCH_DISTANCE_KM
+            )
 
-            if not same_trip_country or is_far_from_day_cluster or is_far_from_trip_cluster:
+            if not same_trip_country or is_far_from_day_cluster or is_far_from_day_city:
                 title = day.get("activities", [])[act_idx].get("title", "") or location.name
                 logger.info(
-                    "ai geocode prune title=%s locality=%s country_code=%s day_distance_km=%.1f trip_distance_km=%s same_day_locality=%s expected_country_code=%s",
+                    "ai geocode prune title=%s locality=%s country_code=%s day_distance_km=%.1f same_day_locality=%s strong_day_city=%s dominant_locality=%s expected_country_code=%s",
                     title,
                     location.locality or "",
                     location.countryCode or "",
                     day_distance_km,
-                    f"{trip_distance_km:.1f}" if trip_distance_km is not None else "n/a",
                     same_day_locality,
+                    has_strong_day_city,
+                    dominant_locality_key,
                     resolved_country_code,
                 )
                 warnings.append(
@@ -1080,11 +1080,34 @@ def dominant_day_reference(
     return centroid_location(cluster)
 
 
-def trip_reference_location(locations: list[TripLocationResponse | None]) -> TripLocationResponse | None:
-    usable = [location for location in locations if is_usable_location(location)]
-    if len(usable) < 2:
-        return None
-    return centroid_location(usable)
+def dominant_day_locality_key(
+    locations: list[TripLocationResponse],
+    resolved_destination: str,
+    resolved_region: str,
+) -> tuple[str, int]:
+    locality_votes: dict[str, int] = {}
+    for location in locations:
+        locality = normalized_locality_key(location.locality)
+        if locality:
+            locality_votes[locality] = locality_votes.get(locality, 0) + 1
+
+    if not locality_votes:
+        return "", 0
+
+    preferred_keys = {
+        normalized_locality_key(resolved_destination),
+        normalized_locality_key(resolved_region),
+    } - {""}
+
+    dominant_key, votes = max(
+        locality_votes.items(),
+        key=lambda item: (
+            item[1],
+            1 if item[0] in preferred_keys else 0,
+            item[0],
+        ),
+    )
+    return dominant_key, votes
 
 
 def centroid_location(locations: list[TripLocationResponse]) -> TripLocationResponse | None:
