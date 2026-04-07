@@ -39,6 +39,29 @@ STRICT_IDENTITY_KEYWORDS = (
     "学院",
     "学校",
 )
+ATTRACTION_PREFERRED_PLACE_TYPES = {
+    "museum",
+    "attraction",
+    "gallery",
+    "memorial",
+    "monument",
+    "park",
+    "temple",
+    "shrine",
+    "castle",
+    "stadium",
+    "theatre",
+    "arts_centre",
+}
+ATTRACTION_TRANSPORT_PLACE_TYPES = {
+    "station",
+    "stop",
+    "subway_entrance",
+    "halt",
+    "tram_stop",
+    "platform",
+    "transportation",
+}
 
 LANDMARK_QUERY_REWRITES: dict[str, tuple[str, ...]] = {
     "bird s nest": (
@@ -380,6 +403,15 @@ async def geocode_single_place(
                 getattr(best, "score", None),
                 getattr(best, "matched_by", []),
             )
+            if not is_context_consistent_result(best, normalized_category):
+                logger.info(
+                    "ai geocode reject title=%s query=%s selected=%s reason=destination_context_mismatch matched_by=%s",
+                    title,
+                    query,
+                    best.name,
+                    getattr(best, "matched_by", []),
+                )
+                continue
             return TripLocationResponse(
                 name=best.name,
                 address=best.address or "",
@@ -401,7 +433,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
 
     # Check DeepSeek output cache first
     cache_key = hashlib.sha256(
-        json.dumps({"cache_version": 7, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
+        json.dumps({"cache_version": 8, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
     ).hexdigest()
     db = MySQLCache()
     ai_output = db.get_ai_cache(cache_key)
@@ -506,8 +538,11 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
         activities: list[ActivityResponse] = []
         for act_idx, act in enumerate(day.get("activities", [])):
             location = location_map.get((day_idx, act_idx))
-            if location is not None:
-                geocoded_locations.append(location)
+            if location is None:
+                warnings.append(f"Skipped unresolved activity: {act.get('title', '')}")
+                logger.info("ai parse skip unresolved activity title=%s", act.get("title", ""))
+                continue
+            geocoded_locations.append(location)
 
             activities.append(ActivityResponse(
                 id=str(uuid.uuid4()),
@@ -705,14 +740,28 @@ def geocode_query_candidates(
     candidates.extend(rewritten_landmark_queries(title))
     candidates.extend([search_name, title])
 
-    simplified = simplify_activity_query(search_name) or simplify_activity_query(title)
-    if simplified:
+    title_base = " ".join((title or "").split())
+    if title_base and destination:
+        candidates.append(f"{title_base} {destination}")
+        if country:
+            candidates.append(f"{title_base} {destination} {country}")
+
+    search_base = " ".join((search_name or "").split())
+    if search_base and destination:
+        candidates.append(f"{search_base} {destination}")
+        if country:
+            candidates.append(f"{search_base} {destination} {country}")
+
+    for base in [simplify_activity_query(title), simplify_activity_query(search_name)]:
+        trimmed_base = " ".join((base or "").split())
+        if not trimmed_base or trimmed_base in {title_base, search_base}:
+            continue
         if destination:
-            candidates.append(f"{simplified} {destination}")
+            candidates.append(f"{trimmed_base} {destination}")
+            if country:
+                candidates.append(f"{trimmed_base} {destination} {country}")
         else:
-            candidates.append(simplified)
-        if country and destination:
-            candidates.append(f"{simplified} {destination} {country}")
+            candidates.append(trimmed_base)
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -753,8 +802,10 @@ def rewritten_landmark_queries(value: str) -> tuple[str, ...]:
 
 
 def select_best_geocode_result(ranked: list, search_name: str, title: str, category: str = "other"):
+    prioritized_ranked = prioritize_destination_context_candidates(ranked, category)
+    prioritized_ranked = prioritize_place_type_candidates(prioritized_ranked, category)
     strict_hints = landmark_name_hints(search_name, title)
-    for item in ranked:
+    for item in prioritized_ranked:
         if should_reject_result(item, category):
             logger.info("ai geocode reject title=%s candidate=%s reason=token_reject", title, item.name)
             continue
@@ -772,7 +823,7 @@ def select_best_geocode_result(ranked: list, search_name: str, title: str, categ
     if category not in {"attraction", "shopping"}:
         return None
     fallback_candidates = sorted(
-        ranked,
+        prioritized_ranked,
         key=lambda item: fallback_candidate_rank(item, title),
     )
     for item in fallback_candidates:
@@ -784,6 +835,34 @@ def select_best_geocode_result(ranked: list, search_name: str, title: str, categ
             logger.info("ai geocode fallback-select title=%s candidate=%s", title, item.name)
             return item
     return None
+
+
+def prioritize_destination_context_candidates(ranked: list, category: str) -> list:
+    if category not in {"attraction", "restaurant", "hotel", "shopping"}:
+        return ranked
+
+    contextual = [
+        item for item in ranked
+        if "destination_context_match" in set(getattr(item, "matched_by", []) or [])
+    ]
+    if contextual:
+        return contextual + [item for item in ranked if item not in contextual]
+    return ranked
+
+
+def prioritize_place_type_candidates(ranked: list, category: str) -> list:
+    if category != "attraction":
+        return ranked
+    return sorted(ranked, key=attraction_place_type_rank)
+
+
+def attraction_place_type_rank(item) -> tuple[int, str]:
+    place_type = normalize_text_for_match(getattr(item, "place_type", "") or "")
+    if place_type in ATTRACTION_PREFERRED_PLACE_TYPES:
+        return (0, place_type)
+    if place_type in ATTRACTION_TRANSPORT_PLACE_TYPES:
+        return (2, place_type)
+    return (1, place_type)
 
 
 def landmark_name_hints(search_name: str, title: str) -> tuple[str, ...]:
@@ -862,6 +941,15 @@ def is_reasonably_confident_result(item, category: str) -> bool:
     return score >= 0.70 and has_strong_context
 
 
+def is_context_consistent_result(item, category: str) -> bool:
+    if category not in {"restaurant", "hotel", "shopping"}:
+        return True
+    matched_by = set(getattr(item, "matched_by", []) or [])
+    if "destination_context_match" in matched_by:
+        return True
+    return False
+
+
 def should_reject_result(item, category: str) -> bool:
     if category != "attraction":
         return False
@@ -871,8 +959,6 @@ def should_reject_result(item, category: str) -> bool:
             None,
             [
                 normalize_text_for_match(getattr(item, "name", "") or ""),
-                normalize_text_for_match(getattr(item, "address", "") or ""),
-                normalize_text_for_match(getattr(item, "subtitle", "") or ""),
                 normalize_text_for_match(getattr(item, "place_type", "") or ""),
             ],
         )

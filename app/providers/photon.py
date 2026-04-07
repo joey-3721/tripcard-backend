@@ -25,9 +25,6 @@ async def search_photon(
     if lang != "default":
         params["lang"] = lang
 
-    if country_filter_code:
-        params["osm_tag"] = f"place:{country_filter_code.lower()}"
-
     response = await client.get(settings.photon_base_url, params=params)
     response.raise_for_status()
     payload: dict[str, Any] = response.json()
