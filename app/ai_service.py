@@ -28,6 +28,16 @@ from app.schemas import (
 logger = logging.getLogger("tripcard-backend")
 MAX_DAY_OUTLIER_DISTANCE_KM = 120.0
 MAX_TRIP_OUTLIER_DISTANCE_KM = 180.0
+MIN_ATTRACTION_CONFIDENCE_SCORE = 0.72
+STRICT_IDENTITY_KEYWORDS = (
+    "university",
+    "college",
+    "school",
+    "campus",
+    "大学",
+    "学院",
+    "学校",
+)
 
 LANDMARK_QUERY_REWRITES: dict[str, tuple[str, ...]] = {
     "bird s nest": (
@@ -361,7 +371,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
 
     # Check DeepSeek output cache first
     cache_key = hashlib.sha256(
-        json.dumps({"cache_version": 2, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
+        json.dumps({"cache_version": 3, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
     ).hexdigest()
     db = MySQLCache()
     ai_output = db.get_ai_cache(cache_key)
@@ -658,9 +668,22 @@ def select_best_geocode_result(ranked: list, search_name: str, title: str, categ
     for item in ranked:
         if should_reject_result(item, category):
             continue
+        if has_strict_identity_requirement(search_name, title, category) and not matches_strict_identity(item, search_name, title):
+            continue
         if not strict_hints:
-            return item
+            if is_reasonably_confident_result(item, category):
+                return item
+            continue
         if result_matches_hints(item, strict_hints):
+            return item
+    if category != "attraction":
+        return None
+    for item in ranked:
+        if should_reject_result(item, category):
+            continue
+        if has_strict_identity_requirement(search_name, title, category) and not matches_strict_identity(item, search_name, title):
+            continue
+        if is_reasonably_confident_result(item, category):
             return item
     return None
 
@@ -684,21 +707,56 @@ def landmark_name_hints(search_name: str, title: str) -> tuple[str, ...]:
 
 
 def result_matches_hints(item, hints: tuple[str, ...]) -> bool:
-    candidate_texts = [
-        compact_match_key(item.name),
-        compact_match_key(item.address or ""),
-        compact_match_key(item.subtitle or ""),
-        compact_match_key(item.locality or ""),
-    ]
-    candidate_texts = [text for text in candidate_texts if text]
-    if not candidate_texts:
+    candidate_name = compact_match_key(item.name)
+    if not candidate_name:
         return False
 
     for hint in hints:
-        for candidate in candidate_texts:
-            if hint in candidate or candidate in hint:
-                return True
+        if hint in candidate_name or candidate_name in hint:
+            return True
     return False
+
+
+def has_strict_identity_requirement(search_name: str, title: str, category: str) -> bool:
+    if category != "attraction":
+        return False
+    combined = " ".join(filter(None, [search_name, title]))
+    normalized = normalize_text_for_match(combined)
+    return any(keyword in normalized for keyword in STRICT_IDENTITY_KEYWORDS)
+
+
+def matches_strict_identity(item, search_name: str, title: str) -> bool:
+    candidate_compact = compact_match_key(" ".join(
+        filter(
+            None,
+            [
+                getattr(item, "name", "") or "",
+                getattr(item, "address", "") or "",
+                getattr(item, "subtitle", "") or "",
+            ],
+        )
+    ))
+    if not candidate_compact:
+        return False
+
+    for source in (search_name, title):
+        source_compact = compact_match_key(source)
+        if not source_compact:
+            continue
+        if source_compact in candidate_compact or candidate_compact in source_compact:
+            return True
+    return False
+
+
+def is_reasonably_confident_result(item, category: str) -> bool:
+    if category != "attraction":
+        return True
+
+    score = float(getattr(item, "score", 0.0) or 0.0)
+    matched_by = set(getattr(item, "matched_by", []) or [])
+    has_name_signal = bool({"name_exact", "name_prefix", "name_contains"} & matched_by)
+    has_context_signal = "destination_context_match" in matched_by or "address_contains" in matched_by
+    return score >= MIN_ATTRACTION_CONFIDENCE_SCORE and (has_name_signal or has_context_signal)
 
 
 def should_reject_result(item, category: str) -> bool:
