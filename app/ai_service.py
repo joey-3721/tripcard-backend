@@ -302,12 +302,18 @@ async def call_deepseek(text: str, destination: str | None, token_info: dict) ->
 
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
+    logger.info("deepseek raw response content=%s", content)
 
     # Strip markdown fences if present
     content = re.sub(r"^```(?:json)?\s*", "", content.strip())
     content = re.sub(r"\s*```$", "", content.strip())
 
-    return json.loads(content)
+    parsed_content = json.loads(content)
+    logger.info(
+        "deepseek parsed response=%s",
+        json.dumps(parsed_content, ensure_ascii=False),
+    )
+    return parsed_content
 
 
 async def geocode_single_place(
@@ -512,18 +518,8 @@ async def geocode_single_place(
 async def parse_itinerary(text: str, destination: str | None, language: str) -> ParseItineraryResponse:
     token_info = get_ai_token("deepseek")
 
-    # Check DeepSeek output cache first
-    cache_key = hashlib.sha256(
-        json.dumps({"cache_version": 8, "text": text, "destination": destination}, ensure_ascii=False, sort_keys=True).encode()
-    ).hexdigest()
-    db = MySQLCache()
-    ai_output = db.get_ai_cache(cache_key)
-    if ai_output is None:
-        ai_output = await call_deepseek(text, destination, token_info)
-        db.set_ai_cache(cache_key, ai_output)
-        logger.info("ai parse cache miss destination=%s", destination or "")
-    else:
-        logger.info("ai parse cache hit destination=%s", destination or "")
+    ai_output = await call_deepseek(text, destination, token_info)
+    logger.info("ai parse no-cache destination=%s", destination or "")
 
     resolved_destination = ai_output.get("destination", destination or "")
     resolved_region = ai_output.get("region", resolved_destination)

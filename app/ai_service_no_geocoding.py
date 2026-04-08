@@ -101,7 +101,7 @@ async def parse_itinerary_no_geocoding(
             )
         )
 
-    return ParseItineraryResponseNoLocation(
+    response = ParseItineraryResponseNoLocation(
         destination=resolved_destination,
         totalDays=len(day_plans_raw),
         summary=ParseItinerarySummaryResponse(
@@ -116,3 +116,8 @@ async def parse_itinerary_no_geocoding(
         rawAiOutput=ai_output,
         warnings=[],
     )
+    logger.info(
+        "parse-itinerary-no-geocoding frontend response=%s",
+        json.dumps(response.model_dump(mode="json"), ensure_ascii=False),
+    )
+    return response
