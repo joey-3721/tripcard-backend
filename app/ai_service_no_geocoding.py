@@ -11,9 +11,12 @@ from app.ai_service import (
     call_deepseek,
     normalize_day_plans_raw,
     normalize_country_code,
+    normalized_summary_title,
+    sanitize_activity_notes,
     standardized_activity_title,
     infer_time_bucket,
     normalize_time_value,
+    sanitize_day_notes,
     infer_time_range,
 )
 from app.cache_mysql import MySQLCache
@@ -55,6 +58,21 @@ async def parse_itinerary_no_geocoding(
             db.set_ai_cache(cache_key, ai_output)
         logger.info("ai parse cache miss destination=%s", destination or "")
 
+    response = build_parse_itinerary_no_geocoding_response(
+        ai_output=ai_output,
+        destination=destination,
+    )
+    logger.info(
+        "parse-itinerary-no-geocoding frontend response=%s",
+        json.dumps(response.model_dump(mode="json"), ensure_ascii=False),
+    )
+    return response
+
+
+def build_parse_itinerary_no_geocoding_response(
+    ai_output: dict,
+    destination: str | None,
+) -> ParseItineraryResponseNoLocation:
     resolved_destination = ai_output.get("destination", destination or "")
     resolved_region = ai_output.get("region", resolved_destination)
     resolved_country = ai_output.get("country", "")
@@ -86,9 +104,7 @@ async def parse_itinerary_no_geocoding(
                     or infer_time_range(act.get("notes") or "")[0],
                     endTime=normalize_time_value(act.get("endTime"))
                     or infer_time_range(act.get("notes") or "")[1],
-                    notes=act.get("notes") or "",
-                    cost=act.get("cost"),
-                    currency=act.get("currency"),
+                    notes=sanitize_activity_notes(act.get("notes")),
                 )
             )
 
@@ -97,15 +113,20 @@ async def parse_itinerary_no_geocoding(
                 id=str(uuid.uuid4()),
                 dayNumber=day.get("dayNumber", day_idx + 1),
                 activities=activities,
-                notes=day.get("notes") or "",
+                notes=sanitize_day_notes(day.get("notes"), day.get("activities", [])),
             )
         )
 
-    response = ParseItineraryResponseNoLocation(
+    return ParseItineraryResponseNoLocation(
         destination=resolved_destination,
         totalDays=len(day_plans_raw),
         summary=ParseItinerarySummaryResponse(
-            title=ai_output.get("title", ""),
+            title=normalized_summary_title(
+                raw_title=str(ai_output.get("title") or ""),
+                destination=resolved_destination,
+                total_days=len(day_plans_raw),
+                day_plans_raw=day_plans_raw,
+            ),
             destination=resolved_destination,
             country=resolved_country,
             countryCode=resolved_country_code,
@@ -113,11 +134,5 @@ async def parse_itinerary_no_geocoding(
             totalDays=len(day_plans_raw),
         ),
         dayPlans=day_plans,
-        rawAiOutput=ai_output,
         warnings=[],
     )
-    logger.info(
-        "parse-itinerary-no-geocoding frontend response=%s",
-        json.dumps(response.model_dump(mode="json"), ensure_ascii=False),
-    )
-    return response

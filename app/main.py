@@ -15,12 +15,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.cache_mysql import MySQLCache
 from app.config import settings
 from app.providers.base import ProviderPlace
-from app.providers.nominatim import search_nominatim
-from app.providers.photon import search_photon
+from app.providers.gaode import search_gaode
+from app.providers.geoapify import fetch_geoapify_batch, search_geoapify
 from app.schemas import (
     ParseItineraryRequest,
     ParseItineraryResponse,
     ParseItineraryResponseNoLocation,
+    ParseItinerarySmartResponse,
     PlaceResult,
     PlaceSearchMeta,
     PlaceSearchRequest,
@@ -41,7 +42,7 @@ async def lifespan(_: FastAPI):
         cache.cleanup()
     db.ensure_ai_tokens_table()
     db.ensure_ai_parse_cache_table()
-    db.ensure_gaode_cache_table()
+    db.ensure_place_geocode_cache_table()
     yield
 
 
@@ -94,11 +95,12 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
     headers = {"User-Agent": settings.user_agent}
     timeout = httpx.Timeout(settings.request_timeout_seconds)
     async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
-        for candidate in context_queries:
-            if settings.enable_nominatim:
+        use_china_provider = should_use_china_provider(request)
+        if use_china_provider:
+            for candidate in context_queries:
                 try:
                     merged.extend(
-                        await search_nominatim(
+                        await search_gaode(
                             client,
                             candidate,
                             request.language,
@@ -106,31 +108,16 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
                             request.limit,
                         )
                     )
-                    if "nominatim" not in providers_used:
-                        providers_used.append("nominatim")
+                    if "gaode" not in providers_used:
+                        providers_used.append("gaode")
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("nominatim failed query=%s error=%r", candidate, exc)
-                    if isinstance(exc, httpx.HTTPStatusError):
-                        logger.warning("nominatim response body=%s", exc.response.text[:300])
-
-
-            if settings.enable_photon and len(merged) < max(request.limit, 8):
-                try:
-                    merged.extend(
-                        await search_photon(
-                            client,
-                            candidate,
-                            request.language,
-                            request.country_filter_code,
-                            request.limit,
-                        )
-                    )
-                    if "photon" not in providers_used:
-                        providers_used.append("photon")
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("photon failed query=%s error=%r", candidate, exc)
-                    if isinstance(exc, httpx.HTTPStatusError):
-                        logger.warning("photon response body=%s", exc.response.text[:300])
+                    logger.warning("gaode failed query=%s error=%r", candidate, exc)
+        else:
+            geoapify_batches = await fetch_geoapify_place_search_batches(client, context_queries, request)
+            for candidate in context_queries:
+                merged.extend(geoapify_batches.get(candidate, []))
+            if any(geoapify_batches.values()):
+                providers_used.append("geoapify")
 
 
     results = rank_and_convert(merged, request)
@@ -142,7 +129,7 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
             scope=request.scope,
             country_filter_code=request.country_filter_code,
             preferred_country_codes=request.preferred_country_codes,
-            fallback_used="photon" in providers_used,
+            fallback_used=False,
             providers_used=providers_used,
             cache_hit=False,
             self_hosted_data=False,
@@ -155,6 +142,39 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
             settings.cache_ttl_seconds,
         )
     return response
+
+
+async def fetch_geoapify_place_search_batches(
+    client: httpx.AsyncClient,
+    context_queries: list[str],
+    request: PlaceSearchRequest,
+) -> dict[str, list[ProviderPlace]]:
+    try:
+        return await fetch_geoapify_batch(
+            client=client,
+            queries=context_queries,
+            language=request.language,
+            country_filter_code=request.country_filter_code,
+            limit=request.limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("geoapify batch failed error=%r", exc)
+        batches: dict[str, list[ProviderPlace]] = {}
+        for query in context_queries:
+            try:
+                batches[query] = await search_geoapify(
+                    client,
+                    query,
+                    request.language,
+                    request.country_filter_code,
+                    request.limit,
+                )
+            except Exception as inner_exc:  # noqa: BLE001
+                logger.warning("geoapify failed query=%s error=%r", query, inner_exc)
+                if isinstance(inner_exc, httpx.HTTPStatusError):
+                    logger.warning("geoapify response body=%s", inner_exc.response.text[:300])
+                batches[query] = []
+        return batches
 
 
 def build_queries(query: str, request: PlaceSearchRequest) -> list[str]:
@@ -180,6 +200,14 @@ def build_queries(query: str, request: PlaceSearchRequest) -> list[str]:
             seen.add(normalized)
             deduped.append(item)
     return deduped
+
+
+def should_use_china_provider(request: PlaceSearchRequest) -> bool:
+    if request.country_filter_code and request.country_filter_code.upper() == "CN":
+        return True
+    if len(request.preferred_country_codes) == 1 and request.preferred_country_codes[0].upper() == "CN":
+        return True
+    return False
 
 
 def build_cache_key(request: PlaceSearchRequest) -> str:
@@ -542,6 +570,26 @@ async def parse_itinerary_no_geocoding_endpoint(request: ParseItineraryRequest) 
     try:
         # use_cache=False for testing phase
         return await parse_itinerary_no_geocoding(request.text, request.destination, request.language, use_cache=False)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="AI service timeout")
+    except httpx.HTTPStatusError as exc:
+        logger.error("DeepSeek API error: %s %s", exc.response.status_code, exc.response.text[:300])
+        raise HTTPException(status_code=502, detail=f"AI service error: {exc.response.status_code}")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON response")
+
+
+@app.post("/v1/ai/parse-itinerary-smart", response_model=ParseItinerarySmartResponse)
+async def parse_itinerary_smart_endpoint(request: ParseItineraryRequest) -> ParseItinerarySmartResponse:
+    if not settings.ai_parse_enabled:
+        raise HTTPException(status_code=503, detail="AI parsing is disabled")
+
+    from app.ai_service_smart import parse_itinerary_smart
+
+    try:
+        return await parse_itinerary_smart(request.text, request.destination, request.language)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except httpx.TimeoutException:

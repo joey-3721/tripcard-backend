@@ -14,6 +14,7 @@ import httpx
 from app.cache_mysql import MySQLCache
 from app.config import settings
 from app.providers.gaode import search_gaode
+from app.providers.geoapify import fetch_geoapify_batch, search_geoapify
 from app.providers.nominatim import search_nominatim
 from app.providers.photon import search_photon
 from app.schemas import (
@@ -31,6 +32,34 @@ logger = logging.getLogger("tripcard-backend")
 MAX_DAY_OUTLIER_DISTANCE_KM = 220.0
 MAX_DAY_CITY_MISMATCH_DISTANCE_KM = 60.0
 MIN_ATTRACTION_CONFIDENCE_SCORE = 0.72
+SHOPPING_PREFERRED_PLACE_TYPES = {
+    "commercial",
+    "mall",
+    "department_store",
+    "shop",
+    "retail",
+    "supermarket",
+}
+BOARDING_PLACE_TYPE_HINTS = {
+    "pier",
+    "port",
+    "harbour",
+    "harbor",
+    "terminal",
+    "ferry",
+    "marina",
+    "dock",
+    "quay",
+    "jetty",
+    "landing",
+}
+BOARDING_TEXT_HINTS = BOARDING_PLACE_TYPE_HINTS | {
+    "boarding",
+    "embark",
+    "embarcadero",
+    "cruise",
+    "boat",
+}
 STRICT_IDENTITY_KEYWORDS = (
     "university",
     "college",
@@ -214,7 +243,7 @@ You are a travel itinerary parser. The user will give you raw travel plan text \
 Return ONLY valid JSON, no markdown fences, no explanation. The JSON schema:
 
 {
-  "title": "string - concise trip card title in the original language, e.g. '巴黎48小时深度玩'",
+  "title": "string - short neutral title, not marketing copy, not exclamation-heavy, e.g. '巴黎两日行程'",
   "destination": "string - primary destination city/region name in the original language",
   "country": "string - country name in the original language if confidently known, else empty string",
   "countryCode": "string - ISO 3166-1 alpha-2 country code (e.g. 'FR' for France, 'CN' for China, 'US' for USA, 'JP' for Japan), REQUIRED",
@@ -229,28 +258,35 @@ Return ONLY valid JSON, no markdown fences, no explanation. The JSON schema:
           "originalMention": "the original mention from user text, may be shorthand like '国博' or '清北'",
           "canonicalTitle": "same as title unless you must preserve a display nuance",
           "searchName": "ENGLISH canonical search query for geocoding, include city in English, e.g. 'Louvre Museum Paris France' or 'Eiffel Tower Paris' or 'Notre-Dame Cathedral Paris'",
+          "activityType": "poi|cruise|ferry|boat_tour|cable_car|ski|safari|shopping_complex|other",
+          "locationMode": "poi|area|boarding_point_required",
+          "placeHint": "string - optional concrete venue/area hint that helps geocoding",
+          "boardingPointHint": "string - optional boarding / entry / departure point hint when locationMode=boarding_point_required",
           "category": "attraction|restaurant|hotel|transport|shopping|other",
           "timeBucket": "morning|noon|afternoon|evening|night|null",
           "startTime": "HH:MM or null",
           "endTime": "HH:MM or null",
-          "notes": "any tips, costs, or details mentioned for this place",
-          "cost": null,
-          "currency": "EUR",
+          "notes": "short actionable note only if genuinely useful, otherwise empty string",
           "needsSplit": false,
           "splitActivities": []
         }
       ],
-      "notes": "general notes for this day"
+      "notes": "short day-level note only if it adds value, otherwise empty string"
     }
   ]
 }
 
 Rules:
 - title should be short and suitable for a trip card
+- title must be neutral and product-like; do NOT parrot slogans such as '攻略', '保姆级', '深度玩', '直接抄作业', exclamation marks, or emotional filler from the source
 - countryCode is REQUIRED - you MUST provide the correct ISO 3166-1 alpha-2 country code based on the destination
 - category MUST be one of: attraction, restaurant, hotel, transport, shopping, other
 - Activities MUST be in chronological order within each day
 - searchName MUST be in English and include the city name for accurate geocoding
+- activityType should describe the activity itself, not just the category
+- locationMode=boarding_point_required for activities that happen across multiple operators or routes and need an embarkation / departure / entry point, such as river cruises, ferries, many boat tours, cable cars, ski passes, safaris
+- when locationMode=boarding_point_required, boardingPointHint should be a concrete embarkation / departure point if reasonably inferable from common knowledge and destination context; otherwise leave it empty instead of inventing
+- placeHint should hold a concrete venue / district / operator / terminal hint only when it materially improves geocoding
 - title and canonicalTitle MUST use the standard full official/common full name, never a local shorthand when the full name is knowable
 - Keep originalMention as the original shorthand or wording from the source text when useful
 - If the source uses a shorthand or alias such as '国博', '鸟巢', '水立方', '故宫', expand it to the canonical full place name in title/canonicalTitle
@@ -258,9 +294,11 @@ Rules:
 - When needsSplit=true, the parent activity is only a container hint and the backend will replace it with splitActivities, so splitActivities must be complete and usable on their own
 - If the text mentions 上午/中午/下午/傍晚/夜晚 or equivalent, fill timeBucket
 - If explicit times like 09:30, 9点半, 14:00-16:00 are present, fill startTime/endTime in 24h HH:MM format
-- If cost is mentioned with a currency symbol, extract both cost and currency
 - Do NOT include transport between places as separate activities unless it is a notable activity (e.g. Seine river cruise)
 - Merge nearby/related items into one activity if they are at the same location
+- notes must be distilled, not copied verbatim from the source; only keep reservation requirements, hard time limits, or concrete must-see hints
+- if a note is just generic praise/opinion/filler, return an empty string
+- day notes should usually be empty unless they add non-redundant routing or booking information
 """
 
 
@@ -320,6 +358,10 @@ async def geocode_single_place(
     client: httpx.AsyncClient,
     search_name: str,
     title: str,
+    activity_type: str,
+    location_mode: str,
+    place_hint: str,
+    boarding_point_hint: str,
     destination: str | None,
     region: str | None,
     country: str | None,
@@ -327,6 +369,7 @@ async def geocode_single_place(
     category: str,
     language: str,
     semaphore: asyncio.Semaphore,
+    geoapify_results_by_query: dict[str, list] | None = None,
 ) -> TripLocationResponse | None:
     async with semaphore:
         from app.main import rank_and_convert
@@ -352,17 +395,44 @@ async def geocode_single_place(
             language=language,
             limit=5,
         )
+        queries = geocode_query_candidates(
+            search_name,
+            title,
+            destination,
+            country,
+            country_code,
+            activity_type=activity_type,
+            location_mode=location_mode,
+            place_hint=place_hint,
+            boarding_point_hint=boarding_point_hint,
+        )
 
-        for query in geocode_query_candidates(search_name, title, destination, country, country_code):
+        # Use Gaode only for China locations - check both country_code and country name
+        should_use_gaode = False
+        if country_code and country_code.upper() == "CN":
+            should_use_gaode = True
+        elif country and any(cn in country.lower() for cn in ["中国", "china", "中華", "中华"]):
+            should_use_gaode = True
+
+        effective_geoapify_results_by_query = geoapify_results_by_query
+        if not should_use_gaode and queries:
+            if effective_geoapify_results_by_query is None:
+                effective_geoapify_results_by_query = await fetch_geoapify_batches(
+                    client=client,
+                    queries=queries,
+                    language=language,
+                    country_filter_code=request.country_filter_code,
+                    limit=request.limit,
+                )
+            else:
+                effective_geoapify_results_by_query = {
+                    query: effective_geoapify_results_by_query.get(query, [])
+                    for query in queries
+                }
+
+        for query in queries:
             request.query = query
             merged = []
-
-            # Use Gaode only for China locations - check both country_code and country name
-            should_use_gaode = False
-            if country_code and country_code.upper() == "CN":
-                should_use_gaode = True
-            elif country and any(cn in country.lower() for cn in ["中国", "china", "中華", "中华"]):
-                should_use_gaode = True
 
             if should_use_gaode:
                 try:
@@ -377,11 +447,10 @@ async def geocode_single_place(
                         # Gaode returned results - use ONLY Gaode, do NOT call other providers
                         merged.extend(gaode_results)
                     else:
-                        # Gaode returned empty - fallback to other providers
-                        logger.info("gaode returned empty for query=%s, using fallback providers", query)
+                        logger.info("gaode returned empty for query=%s, using geoapify fallback", query)
                         try:
                             merged.extend(
-                                await search_nominatim(
+                                await search_geoapify(
                                     client,
                                     query,
                                     language,
@@ -390,26 +459,13 @@ async def geocode_single_place(
                                 )
                             )
                         except Exception as exc:
-                            logger.warning("geocode nominatim failed query=%s error=%r", query, exc)
-
-                        try:
-                            merged.extend(
-                                await search_photon(
-                                    client,
-                                    query,
-                                    "en",
-                                    request.country_filter_code,
-                                    request.limit,
-                                )
-                            )
-                        except Exception as exc:
-                            logger.warning("geocode photon failed query=%s error=%r", query, exc)
+                            logger.warning("geocode geoapify failed query=%s error=%r", query, exc)
                 except Exception as exc:
                     logger.warning("geocode gaode failed query=%s error=%r", query, exc)
-                    # Gaode failed - fallback to other providers
+                    # Gaode failed - fallback to overseas provider
                     try:
                         merged.extend(
-                            await search_nominatim(
+                            await search_geoapify(
                                 client,
                                 query,
                                 language,
@@ -418,47 +474,9 @@ async def geocode_single_place(
                             )
                         )
                     except Exception as exc:
-                        logger.warning("geocode nominatim failed query=%s error=%r", query, exc)
-
-                    try:
-                        merged.extend(
-                            await search_photon(
-                                client,
-                                query,
-                                "en",
-                                request.country_filter_code,
-                                request.limit,
-                            )
-                        )
-                    except Exception as exc:
-                        logger.warning("geocode photon failed query=%s error=%r", query, exc)
+                        logger.warning("geocode geoapify failed query=%s error=%r", query, exc)
             else:
-                # Non-China: use Nominatim and Photon
-                try:
-                    merged.extend(
-                        await search_nominatim(
-                            client,
-                            query,
-                            language,
-                            request.country_filter_code,
-                            request.limit,
-                        )
-                    )
-                except Exception as exc:
-                    logger.warning("geocode nominatim failed query=%s error=%r", query, exc)
-
-                try:
-                    merged.extend(
-                        await search_photon(
-                            client,
-                            query,
-                            "en",
-                            request.country_filter_code,
-                            request.limit,
-                        )
-                    )
-                except Exception as exc:
-                    logger.warning("geocode photon failed query=%s error=%r", query, exc)
+                merged.extend(effective_geoapify_results_by_query.get(query, []))
 
             ranked = rank_and_convert(merged, request)
             logger.info(
@@ -476,6 +494,10 @@ async def geocode_single_place(
                 search_name=search_name,
                 title=title,
                 category=normalized_category,
+                activity_type=activity_type,
+                location_mode=location_mode,
+                place_hint=place_hint,
+                boarding_point_hint=boarding_point_hint,
             )
             if best is None:
                 logger.info("ai geocode no-match title=%s query=%s", title, query)
@@ -515,12 +537,52 @@ async def geocode_single_place(
         return None
 
 
+async def fetch_geoapify_batches(
+    client: httpx.AsyncClient,
+    queries: list[str],
+    language: str,
+    country_filter_code: str | None,
+    limit: int,
+) -> dict[str, list]:
+    try:
+        return await fetch_geoapify_batch(
+            client=client,
+            queries=queries,
+            language=language,
+            country_filter_code=country_filter_code,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.warning("geocode geoapify batch failed error=%r", exc)
+        results: dict[str, list] = {}
+        for query in queries:
+            try:
+                results[query] = await search_geoapify(
+                    client,
+                    query,
+                    language,
+                    country_filter_code,
+                    limit,
+                )
+            except Exception as inner_exc:
+                logger.warning("geocode geoapify failed query=%s error=%r", query, inner_exc)
+                results[query] = []
+        return results
+
+
 async def parse_itinerary(text: str, destination: str | None, language: str) -> ParseItineraryResponse:
     token_info = get_ai_token("deepseek")
 
     ai_output = await call_deepseek(text, destination, token_info)
     logger.info("ai parse no-cache destination=%s", destination or "")
+    return await parse_itinerary_from_ai_output(ai_output, destination, language)
 
+
+async def parse_itinerary_from_ai_output(
+    ai_output: dict,
+    destination: str | None,
+    language: str,
+) -> ParseItineraryResponse:
     resolved_destination = ai_output.get("destination", destination or "")
     resolved_region = ai_output.get("region", resolved_destination)
     resolved_country = ai_output.get("country", "")
@@ -537,7 +599,18 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
             search_name = act.get("searchName") or act.get("title", "")
             category = act.get("category", "other")
             if search_name:
-                geocode_tasks.append((search_name, standardized_activity_title(act), act.get("originalMention", ""), category))
+                geocode_tasks.append(
+                    (
+                        search_name,
+                        standardized_activity_title(act),
+                        act.get("originalMention", ""),
+                        category,
+                        normalized_activity_type(act),
+                        normalized_location_mode(act),
+                        str(act.get("placeHint") or "").strip(),
+                        str(act.get("boardingPointHint") or "").strip(),
+                    )
+                )
                 task_indices.append((day_idx, act_idx))
 
     # Geocode all places concurrently
@@ -569,11 +642,45 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
                 resolved_region,
                 resolved_country,
             )
+        prefetched_geoapify_results: dict[str, list] | None = None
+        if resolved_country_code != "CN":
+            all_geoapify_queries: list[str] = []
+            seen_geoapify_queries: set[str] = set()
+            for name, title, _original_mention, _cat, activity_type, location_mode, place_hint, boarding_point_hint in geocode_tasks:
+                queries = geocode_query_candidates(
+                    name,
+                    title,
+                    resolved_destination,
+                    resolved_country,
+                    resolved_country_code,
+                    activity_type=activity_type,
+                    location_mode=location_mode,
+                    place_hint=place_hint,
+                    boarding_point_hint=boarding_point_hint,
+                )
+                for query in queries:
+                    normalized = " ".join(query.split()).lower()
+                    if not normalized or normalized in seen_geoapify_queries:
+                        continue
+                    seen_geoapify_queries.add(normalized)
+                    all_geoapify_queries.append(query)
+            if all_geoapify_queries:
+                prefetched_geoapify_results = await fetch_geoapify_batches(
+                    client=client,
+                    queries=all_geoapify_queries,
+                    language=language,
+                    country_filter_code=resolved_country_code or None,
+                    limit=5,
+                )
         coros = [
             geocode_single_place(
                 client,
                 search_name=name,
                 title=title or original_mention,
+                activity_type=activity_type,
+                location_mode=location_mode,
+                place_hint=place_hint,
+                boarding_point_hint=boarding_point_hint,
                 destination=resolved_destination,
                 region=resolved_region,
                 country=resolved_country,
@@ -581,8 +688,9 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
                 category=cat,
                 language=language,
                 semaphore=semaphore,
+                geoapify_results_by_query=prefetched_geoapify_results,
             )
-            for name, title, original_mention, cat in geocode_tasks
+            for name, title, original_mention, cat, activity_type, location_mode, place_hint, boarding_point_hint in geocode_tasks
         ]
         locations = await asyncio.gather(*coros, return_exceptions=True)
 
@@ -629,16 +737,14 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
                 timeBucket=infer_time_bucket(act),
                 startTime=normalize_time_value(act.get("startTime")) or infer_time_range(act.get("notes") or "")[0],
                 endTime=normalize_time_value(act.get("endTime")) or infer_time_range(act.get("notes") or "")[1],
-                notes=act.get("notes") or "",
-                cost=act.get("cost"),
-                currency=act.get("currency"),
+                notes=sanitize_activity_notes(act.get("notes")),
             ))
 
         day_plans.append(DayPlanResponse(
             id=str(uuid.uuid4()),
             dayNumber=day.get("dayNumber", day_idx + 1),
             activities=activities,
-            notes=day.get("notes") or "",
+            notes=sanitize_day_notes(day.get("notes"), day.get("activities", [])),
         ))
 
     total_days = ai_output.get("totalDays", len(day_plans))
@@ -646,6 +752,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
         ai_output=ai_output,
         resolved_destination=resolved_destination,
         total_days=total_days,
+        day_plans_raw=day_plans_raw,
         geocoded_locations=geocoded_locations,
     )
 
@@ -654,7 +761,6 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
         totalDays=total_days,
         summary=summary,
         dayPlans=day_plans,
-        rawAiOutput=ai_output,
         warnings=warnings,
     )
 
@@ -684,10 +790,11 @@ async def infer_country_code_for_query(
     query: str,
     language: str,
 ) -> str:
-    # Don't use Gaode for country inference - it only returns China results
-    for provider in ("nominatim", "photon"):
+    for provider in ("geoapify", "photon", "nominatim"):
         try:
-            if provider == "nominatim":
+            if provider == "geoapify":
+                items = await search_geoapify(client, query, language, None, 3)
+            elif provider == "nominatim":
                 items = await search_nominatim(client, query, language, None, 3)
             else:
                 items = await search_photon(client, query, "en", None, 3)
@@ -758,6 +865,10 @@ def normalize_activity_dict(activity: dict) -> list[dict]:
         normalized["title"] = title or str(activity.get("title") or "").strip()
         if title and not normalized.get("canonicalTitle"):
             normalized["canonicalTitle"] = title
+        normalized["activityType"] = normalized_activity_type(normalized)
+        normalized["locationMode"] = normalized_location_mode(normalized)
+        normalized["placeHint"] = str(normalized.get("placeHint") or "").strip()
+        normalized["boardingPointHint"] = str(normalized.get("boardingPointHint") or "").strip()
         return [normalized]
 
     if "split" in rule:
@@ -768,6 +879,10 @@ def normalize_activity_dict(activity: dict) -> list[dict]:
             normalized["canonicalTitle"] = split_entry["title"]
             normalized["searchName"] = split_entry["searchName"]
             normalized["category"] = split_entry.get("category", activity.get("category", "other"))
+            normalized["activityType"] = normalized_activity_type(normalized)
+            normalized["locationMode"] = normalized_location_mode(normalized)
+            normalized["placeHint"] = str(normalized.get("placeHint") or "").strip()
+            normalized["boardingPointHint"] = str(normalized.get("boardingPointHint") or "").strip()
             split_activities.append(normalized)
         return split_activities
 
@@ -775,6 +890,10 @@ def normalize_activity_dict(activity: dict) -> list[dict]:
     normalized["title"] = rule["title"]
     normalized["canonicalTitle"] = rule["title"]
     normalized["searchName"] = rule["search_name"]
+    normalized["activityType"] = normalized_activity_type(normalized)
+    normalized["locationMode"] = normalized_location_mode(normalized)
+    normalized["placeHint"] = str(normalized.get("placeHint") or "").strip()
+    normalized["boardingPointHint"] = str(normalized.get("boardingPointHint") or "").strip()
     return [normalized]
 
 
@@ -796,6 +915,45 @@ def standardized_activity_title(activity: dict) -> str:
     return ""
 
 
+def normalized_activity_type(activity: dict) -> str:
+    raw = normalize_text_for_match(str(activity.get("activityType") or ""))
+    if raw in {"poi", "cruise", "ferry", "boat_tour", "cable_car", "ski", "safari", "shopping_complex", "other"}:
+        return raw
+
+    text = " ".join(
+        filter(
+            None,
+            [
+                str(activity.get("title") or ""),
+                str(activity.get("searchName") or ""),
+                str(activity.get("notes") or ""),
+            ],
+        )
+    ).lower()
+    if any(token in text for token in ("cruise", "river cruise", "boat tour", "boat trip", "boat ride", "游船", "游艇", "游河")):
+        return "cruise"
+    if any(token in text for token in ("ferry", "渡轮", "輪渡")):
+        return "ferry"
+    if any(token in text for token in ("cable car", "gondola", "缆车", "纜車")):
+        return "cable_car"
+    if any(token in text for token in ("safari", "野生动物", "野生動物")):
+        return "safari"
+    if activity.get("category") == "shopping":
+        return "shopping_complex"
+    return "poi"
+
+
+def normalized_location_mode(activity: dict) -> str:
+    raw = normalize_text_for_match(str(activity.get("locationMode") or ""))
+    if raw in {"poi", "area", "boarding_point_required"}:
+        return raw
+
+    activity_type = normalized_activity_type(activity)
+    if activity_type in {"cruise", "ferry", "boat_tour", "cable_car", "ski", "safari"}:
+        return "boarding_point_required"
+    return "poi"
+
+
 def canonical_activity_rule(title: str) -> dict | None:
     normalized_title = compact_match_key(title)
     if not normalized_title:
@@ -813,6 +971,10 @@ def geocode_query_candidates(
     destination: str | None,
     country: str | None,
     country_code: str | None = None,
+    activity_type: str = "poi",
+    location_mode: str = "poi",
+    place_hint: str = "",
+    boarding_point_hint: str = "",
 ) -> list[str]:
     candidates: list[str] = []
 
@@ -842,13 +1004,20 @@ def geocode_query_candidates(
             else:
                 candidates.append(trimmed_base)
     else:
-        # For non-China: use English search_name first
+        # For non-China: prefer structured English hints first
+        if boarding_point_hint:
+            candidates.extend(build_structured_hint_queries(boarding_point_hint, destination, country))
+        if place_hint:
+            candidates.extend(build_structured_hint_queries(place_hint, destination, country))
+        if location_mode == "boarding_point_required":
+            candidates.extend(build_boarding_queries(search_name, title, destination, country))
+
         candidates.extend(rewritten_landmark_queries(search_name))
         candidates.extend(rewritten_landmark_queries(title))
-        candidates.extend([search_name, title])
+        candidates.extend([search_name, simplify_activity_query(search_name), title])
 
         title_base = " ".join((title or "").split())
-        if title_base and destination:
+        if title_base and destination and location_mode != "boarding_point_required":
             candidates.append(f"{title_base} {destination}")
             if country:
                 candidates.append(f"{title_base} {destination} {country}")
@@ -886,6 +1055,37 @@ def geocode_query_candidates(
     return deduped
 
 
+def build_structured_hint_queries(hint: str, destination: str | None, country: str | None) -> list[str]:
+    normalized_hint = " ".join((hint or "").split())
+    if not normalized_hint:
+        return []
+    queries = [normalized_hint]
+    if destination:
+        queries.append(f"{normalized_hint} {destination}")
+        if country:
+            queries.append(f"{normalized_hint} {destination} {country}")
+    return queries
+
+
+def build_boarding_queries(search_name: str, title: str, destination: str | None, country: str | None) -> list[str]:
+    queries: list[str] = []
+    base_candidates = [search_name, simplify_activity_query(search_name), title, simplify_activity_query(title)]
+    for base in base_candidates:
+        normalized_base = " ".join((base or "").split())
+        if not normalized_base:
+            continue
+        queries.append(f"{normalized_base} boarding point")
+        queries.append(f"{normalized_base} embarkation")
+        if destination:
+            queries.append(f"{normalized_base} boarding point {destination}")
+            queries.append(f"{normalized_base} embarkation {destination}")
+            queries.append(f"{normalized_base} pier {destination}")
+            queries.append(f"{normalized_base} port {destination}")
+            if country:
+                queries.append(f"{normalized_base} boarding point {destination} {country}")
+    return queries
+
+
 def simplify_activity_query(value: str) -> str:
     if not value:
         return ""
@@ -908,13 +1108,33 @@ def rewritten_landmark_queries(value: str) -> tuple[str, ...]:
     return LANDMARK_QUERY_REWRITES.get(key, ())
 
 
-def select_best_geocode_result(ranked: list, search_name: str, title: str, category: str = "other"):
+def select_best_geocode_result(
+    ranked: list,
+    search_name: str,
+    title: str,
+    category: str = "other",
+    activity_type: str = "poi",
+    location_mode: str = "poi",
+    place_hint: str = "",
+    boarding_point_hint: str = "",
+):
     prioritized_ranked = prioritize_destination_context_candidates(ranked, category)
-    prioritized_ranked = prioritize_place_type_candidates(prioritized_ranked, category)
+    prioritized_ranked = prioritize_place_type_candidates(
+        prioritized_ranked,
+        category,
+        activity_type=activity_type,
+        location_mode=location_mode,
+    )
     strict_hints = landmark_name_hints(search_name, title)
     for item in prioritized_ranked:
         if should_reject_result(item, category):
             logger.info("ai geocode reject title=%s candidate=%s reason=token_reject", title, item.name)
+            continue
+        if location_mode == "boarding_point_required" and not looks_like_boarding_location(item):
+            logger.info("ai geocode reject title=%s candidate=%s reason=boarding_point_mismatch", title, item.name)
+            continue
+        if category == "shopping" and not looks_like_valid_shopping_result(item, search_name, title, place_hint):
+            logger.info("ai geocode reject title=%s candidate=%s reason=shopping_mismatch", title, item.name)
             continue
         if has_strict_identity_requirement(search_name, title, category) and not matches_strict_identity(item, search_name, title):
             logger.info("ai geocode reject title=%s candidate=%s reason=strict_identity_mismatch", title, item.name)
@@ -935,6 +1155,10 @@ def select_best_geocode_result(ranked: list, search_name: str, title: str, categ
     )
     for item in fallback_candidates:
         if should_reject_result(item, category):
+            continue
+        if location_mode == "boarding_point_required" and not looks_like_boarding_location(item):
+            continue
+        if category == "shopping" and not looks_like_valid_shopping_result(item, search_name, title, place_hint):
             continue
         if has_strict_identity_requirement(search_name, title, category) and not matches_strict_identity(item, search_name, title):
             continue
@@ -957,19 +1181,34 @@ def prioritize_destination_context_candidates(ranked: list, category: str) -> li
     return ranked
 
 
-def prioritize_place_type_candidates(ranked: list, category: str) -> list:
+def prioritize_place_type_candidates(ranked: list, category: str, activity_type: str = "poi", location_mode: str = "poi") -> list:
+    if category == "shopping":
+        return sorted(ranked, key=lambda item: shopping_place_type_rank(item, activity_type))
     if category != "attraction":
         return ranked
-    return sorted(ranked, key=attraction_place_type_rank)
+    return sorted(ranked, key=lambda item: attraction_place_type_rank(item, location_mode))
 
 
-def attraction_place_type_rank(item) -> tuple[int, str]:
+def attraction_place_type_rank(item, location_mode: str = "poi") -> tuple[int, str]:
     place_type = normalize_text_for_match(getattr(item, "place_type", "") or "")
+    if location_mode == "boarding_point_required":
+        if any(token in place_type for token in BOARDING_PLACE_TYPE_HINTS):
+            return (0, place_type)
+        return (2, place_type)
     if place_type in ATTRACTION_PREFERRED_PLACE_TYPES:
         return (0, place_type)
     if place_type in ATTRACTION_TRANSPORT_PLACE_TYPES:
         return (2, place_type)
     return (1, place_type)
+
+
+def shopping_place_type_rank(item, activity_type: str = "poi") -> tuple[int, str]:
+    place_type = normalize_text_for_match(getattr(item, "place_type", "") or "")
+    if place_type in SHOPPING_PREFERRED_PLACE_TYPES:
+        return (0, place_type)
+    if activity_type == "shopping_complex" and "shop" in place_type:
+        return (1, place_type)
+    return (2, place_type)
 
 
 def landmark_name_hints(search_name: str, title: str) -> tuple[str, ...]:
@@ -1071,6 +1310,42 @@ def should_reject_result(item, category: str) -> bool:
         )
     )
     return any(token in item_text for token in ATTRACTION_RESULT_REJECT_TOKENS)
+
+
+def looks_like_boarding_location(item) -> bool:
+    text = " ".join(
+        filter(
+            None,
+            [
+                normalize_text_for_match(getattr(item, "name", "") or ""),
+                normalize_text_for_match(getattr(item, "address", "") or ""),
+                normalize_text_for_match(getattr(item, "subtitle", "") or ""),
+                normalize_text_for_match(getattr(item, "place_type", "") or ""),
+            ],
+        )
+    )
+    return any(token in text for token in BOARDING_TEXT_HINTS)
+
+
+def looks_like_valid_shopping_result(item, search_name: str, title: str, place_hint: str) -> bool:
+    text = " ".join(
+        filter(
+            None,
+            [
+                getattr(item, "name", "") or "",
+                getattr(item, "address", "") or "",
+                getattr(item, "subtitle", "") or "",
+            ],
+        )
+    )
+    if not text:
+        return False
+
+    place_type = normalize_text_for_match(getattr(item, "place_type", "") or "")
+    has_shopping_type = any(token in place_type for token in SHOPPING_PREFERRED_PLACE_TYPES)
+    strict_sources = tuple(filter(None, [search_name, title, place_hint]))
+    has_name_match = any(soft_name_match(source, text) for source in strict_sources)
+    return has_name_match and (has_shopping_type or "destination_context_match" in set(getattr(item, "matched_by", []) or []))
 
 
 def compact_match_key(value: str | None) -> str:
@@ -1379,9 +1654,15 @@ def build_summary(
     ai_output: dict,
     resolved_destination: str,
     total_days: int,
+    day_plans_raw: list[dict],
     geocoded_locations: list[TripLocationResponse],
 ) -> ParseItinerarySummaryResponse:
-    title = str(ai_output.get("title") or "").strip()
+    title = normalized_summary_title(
+        raw_title=str(ai_output.get("title") or "").strip(),
+        destination=resolved_destination,
+        total_days=total_days,
+        day_plans_raw=day_plans_raw,
+    )
     country = str(ai_output.get("country") or "").strip()
     region = str(ai_output.get("region") or "").strip()
 
@@ -1409,10 +1690,6 @@ def build_summary(
         country = inferred_country or ""
     if not region:
         region = inferred_region or resolved_destination
-    if not title:
-        duration_suffix = f"{total_days}天行程" if total_days > 0 else "行程"
-        title = f"{resolved_destination}{duration_suffix}" if resolved_destination else duration_suffix
-
     return ParseItinerarySummaryResponse(
         title=title,
         destination=resolved_destination,
@@ -1427,6 +1704,123 @@ def most_common_value(counts: dict[str, int]) -> str | None:
     if not counts:
         return None
     return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def normalized_summary_title(raw_title: str, destination: str, total_days: int, day_plans_raw: list[dict]) -> str:
+    fallback = generated_summary_title(destination, total_days, day_plans_raw)
+    title = re.sub(r"\s+", " ", raw_title).strip(" \n\r\t!！")
+    if not title:
+        return fallback
+
+    lowered = title.lower()
+    banned_tokens = ("攻略", "保姆级", "深度玩", "抄作业", "刚从", "真实", "必看", "超全", "超详细")
+    if any(token in title for token in banned_tokens):
+        return fallback
+    if lowered == destination.lower():
+        return fallback
+    return title
+
+
+def generated_summary_title(destination: str, total_days: int, day_plans_raw: list[dict]) -> str:
+    destination_part = destination or "目的地"
+    duration_part = f"{total_days}天" if total_days > 0 else ""
+
+    themes = itinerary_theme_labels(day_plans_raw)
+    if themes:
+        return f"{destination_part}{''.join(themes[:2])}{duration_part}行程"
+    return f"{destination_part}{duration_part}行程"
+
+
+def itinerary_theme_labels(day_plans_raw: list[dict]) -> list[str]:
+    scores: dict[str, int] = {}
+    for day in day_plans_raw:
+        for activity in day.get("activities", []):
+            for label in theme_labels_for_activity(activity):
+                scores[label] = scores.get(label, 0) + 1
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], len(item[0]), item[0]))
+    return [label for label, _ in ranked]
+
+
+def theme_labels_for_activity(activity: dict) -> list[str]:
+    category = str(activity.get("category") or "")
+    activity_type = normalized_activity_type(activity)
+    text = " ".join(filter(None, [str(activity.get("title") or ""), str(activity.get("searchName") or "")])).lower()
+
+    labels: list[str] = []
+    if activity_type in {"cruise", "ferry", "boat_tour"}:
+        labels.append("游船")
+    if activity_type == "shopping_complex" or category == "shopping":
+        labels.append("购物")
+    if any(token in text for token in ("museum", "博物馆", "gallery", "art")):
+        labels.append("博物馆")
+    if any(token in text for token in ("cathedral", "church", "basilica", "寺", "教堂", "圣母院")):
+        labels.append("教堂")
+    if any(token in text for token in ("park", "garden", "花园", "公园")):
+        labels.append("公园")
+    if category == "attraction" and not labels:
+        labels.append("地标")
+    return labels
+
+
+def sanitize_activity_notes(value: str | None) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+
+    filler_tokens = (
+        "真的必去",
+        "很好拍",
+        "很出片",
+        "超美",
+        "推荐打卡",
+        "值得一去",
+        "非常好",
+        "太美了",
+        "拍照很好看",
+    )
+    for token in filler_tokens:
+        text = text.replace(token, "").strip(" ,，。；;")
+
+    if not text:
+        return ""
+
+    useful_signals = (
+        "提前",
+        "预约",
+        "订票",
+        "排队",
+        "小时",
+        "分钟",
+        "必看",
+        "登船",
+        "入口",
+        "上船",
+        "换票",
+    )
+    if any(signal in text for signal in useful_signals):
+        return text[:120]
+
+    return ""
+
+
+def sanitize_day_notes(value: str | None, activities: list[dict]) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    if any(token in text for token in ("路线", "day", "day1", "day2", "d1", "d2")):
+        return ""
+
+    normalized_titles = {
+        re.sub(r"\s+", "", str(activity.get("title") or ""))
+        for activity in activities
+        if str(activity.get("title") or "").strip()
+    }
+    compact_text = re.sub(r"\s+", "", text)
+    if normalized_titles and all(title in compact_text for title in normalized_titles if len(title) >= 2):
+        return ""
+
+    useful_signals = ("提前", "预约", "订票", "登船", "换票", "闭馆", "开放", "排队")
+    return text[:120] if any(signal in text for signal in useful_signals) else ""
 
 
 def infer_time_bucket(activity: dict) -> str | None:

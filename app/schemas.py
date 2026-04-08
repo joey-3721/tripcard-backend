@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 SearchScope = Literal["all", "domestic", "international"]
 SearchCategory = Literal["hotel", "attraction", "restaurant", "shopping", "transport", "other"]
+ItineraryGeocodingMode = Literal["client_apple", "backend_geoapify"]
 
 
 class DestinationSeed(BaseModel):
@@ -110,8 +111,6 @@ class ActivityResponse(BaseModel):
     startTime: str | None = None
     endTime: str | None = None
     notes: str = ""
-    cost: float | None = None
-    currency: str | None = None
 
 
 class DayPlanResponse(BaseModel):
@@ -136,7 +135,6 @@ class ParseItineraryResponse(BaseModel):
     totalDays: int
     summary: ParseItinerarySummaryResponse | None = None
     dayPlans: list[DayPlanResponse]
-    rawAiOutput: dict | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -152,8 +150,6 @@ class ActivityResponseNoLocation(BaseModel):
     startTime: str | None = None
     endTime: str | None = None
     notes: str = ""
-    cost: float | None = None
-    currency: str | None = None
 
 
 class DayPlanResponseNoLocation(BaseModel):
@@ -171,6 +167,33 @@ class ParseItineraryResponseNoLocation(BaseModel):
     totalDays: int
     summary: ParseItinerarySummaryResponse | None = None
     dayPlans: list[DayPlanResponseNoLocation]
-    rawAiOutput: dict | None = None
     warnings: list[str] = Field(default_factory=list)
 
+
+class ActivityResponseSmart(BaseModel):
+    id: str
+    title: str
+    searchName: str | None = None
+    category: ActivityCategoryType = "other"
+    location: TripLocationResponse | None = None
+    timeBucket: ActivityTimeBucketType | None = None
+    startTime: str | None = None
+    endTime: str | None = None
+    notes: str = ""
+
+
+class DayPlanResponseSmart(BaseModel):
+    id: str
+    dayNumber: int
+    date: str | None = None
+    activities: list[ActivityResponseSmart]
+    notes: str = ""
+
+
+class ParseItinerarySmartResponse(BaseModel):
+    destination: str
+    totalDays: int
+    summary: ParseItinerarySummaryResponse | None = None
+    dayPlans: list[DayPlanResponseSmart]
+    warnings: list[str] = Field(default_factory=list)
+    geocodingMode: ItineraryGeocodingMode

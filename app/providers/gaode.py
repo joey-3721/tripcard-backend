@@ -26,7 +26,13 @@ async def search_gaode(
     db = MySQLCache()
 
     # Check cache first
-    cached_results = db.get_gaode_cache(query, limit)
+    cached_results = db.get_place_geocode_cache(
+        source="gaode",
+        query=query,
+        language=language,
+        country_filter_code=country_filter_code,
+        limit=limit,
+    )
     if cached_results:
         logger.info("gaode cache hit query=%s results=%d", query, len(cached_results))
         items: list[ProviderPlace] = []
@@ -80,7 +86,49 @@ async def search_gaode(
 
         # Cache the results
         if pois:
-            db.set_gaode_cache(query, pois)
+            cache_rows: list[dict[str, Any]] = []
+            for poi in pois:
+                location = poi.get("location", "")
+                if not location or "," not in location:
+                    continue
+                try:
+                    lon_str, lat_str = location.split(",", 1)
+                    longitude = float(lon_str)
+                    latitude = float(lat_str)
+                except (ValueError, AttributeError):
+                    continue
+
+                province = poi.get("pname", "")
+                city = poi.get("cityname", "")
+                district = poi.get("adname", "")
+                address = poi.get("address", "")
+                locality = city or district or province
+                subtitle = ", ".join([p for p in [city, district] if p]) or None
+                full_address = "".join([p for p in [province, city, district, address] if p]) or None
+
+                cache_rows.append(
+                    {
+                        "place_id": poi.get("id"),
+                        "name": poi.get("name", "").strip(),
+                        "address": full_address,
+                        "subtitle": subtitle,
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "country": "中国",
+                        "country_code": "CN",
+                        "locality": locality,
+                        "place_type": poi.get("type"),
+                        "category": poi.get("typecode"),
+                        "full_response": poi,
+                    }
+                )
+            db.set_place_geocode_cache(
+                source="gaode",
+                query=query,
+                language=language,
+                country_filter_code=country_filter_code,
+                rows=cache_rows,
+            )
             logger.info("gaode api call query=%s results=%d cached", query, len(pois))
 
         items: list[ProviderPlace] = []

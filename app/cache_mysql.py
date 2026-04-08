@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from typing import Any
@@ -178,9 +179,42 @@ class MySQLCache:
                     """
                 )
 
+    def ensure_place_geocode_cache_table(self) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS `place_geocode_cache` (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        source VARCHAR(32) NOT NULL,
+                        query_key VARCHAR(64) NOT NULL,
+                        query_text VARCHAR(500) NOT NULL,
+                        language VARCHAR(32) NOT NULL DEFAULT 'en',
+                        country_filter_code VARCHAR(8) NULL,
+                        cache_item_key VARCHAR(160) NOT NULL,
+                        place_id VARCHAR(128),
+                        name VARCHAR(255) NOT NULL,
+                        address TEXT,
+                        subtitle VARCHAR(255),
+                        latitude DECIMAL(10, 7) NOT NULL,
+                        longitude DECIMAL(11, 7) NOT NULL,
+                        country VARCHAR(120),
+                        country_code VARCHAR(8),
+                        locality VARCHAR(120),
+                        place_type VARCHAR(120),
+                        category VARCHAR(120),
+                        full_response JSON,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY idx_source_query_item (source, query_key, cache_item_key),
+                        INDEX idx_source_query_key (source, query_key),
+                        INDEX idx_name (name)
+                    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                    """
+                )
+
     def get_gaode_cache(self, query: str, limit: int = 20) -> list[dict] | None:
         """Get cached Gaode results for a query."""
-        import hashlib
         query_key = hashlib.md5(query.encode('utf-8')).hexdigest()
 
         with self._connect() as conn:
@@ -201,7 +235,6 @@ class MySQLCache:
 
     def set_gaode_cache(self, query: str, pois: list[dict]) -> None:
         """Cache Gaode API results."""
-        import hashlib
         query_key = hashlib.md5(query.encode('utf-8')).hexdigest()
 
         with self._connect() as conn:
@@ -253,3 +286,278 @@ class MySQLCache:
                             json.dumps(poi, ensure_ascii=False),
                         ),
                     )
+
+    def get_geoapify_cache(
+        self,
+        query: str,
+        language: str,
+        country_filter_code: str | None,
+        limit: int = 20,
+    ) -> list[dict] | None:
+        query_key = self._geocode_query_key("geoapify", query, language, country_filter_code)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT place_id, name, address, subtitle,
+                           latitude, longitude, country, country_code, locality, place_type, category
+                    FROM `place_geocode_cache`
+                    WHERE source = %s AND query_key = %s
+                    ORDER BY id
+                    LIMIT %s
+                    """,
+                    ("geoapify", query_key, limit),
+                )
+                rows = cur.fetchall()
+                return rows if rows else None
+
+    def set_geoapify_cache(
+        self,
+        query: str,
+        language: str,
+        country_filter_code: str | None,
+        results: list[dict],
+    ) -> None:
+        query_key = self._geocode_query_key("geoapify", query, language, country_filter_code)
+        normalized_filter = (country_filter_code or "").upper() or None
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                for row in results:
+                    lat = row.get("lat")
+                    lon = row.get("lon")
+                    if lat is None or lon is None:
+                        continue
+
+                    name = str(row.get("name") or row.get("formatted") or "").strip()
+                    if not name:
+                        continue
+
+                    locality = (
+                        row.get("city")
+                        or row.get("town")
+                        or row.get("village")
+                        or row.get("suburb")
+                        or row.get("state")
+                    )
+                    country = row.get("country")
+                    subtitle = ", ".join([part for part in [locality, country] if part]) or None
+
+                    cur.execute(
+                        """
+                        INSERT INTO `place_geocode_cache`
+                        (source, query_key, query_text, language, country_filter_code, cache_item_key, place_id, name, address, subtitle,
+                         latitude, longitude, country, country_code, locality, place_type, category, full_response)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            name = VALUES(name),
+                            address = VALUES(address),
+                            subtitle = VALUES(subtitle),
+                            latitude = VALUES(latitude),
+                            longitude = VALUES(longitude),
+                            country = VALUES(country),
+                            country_code = VALUES(country_code),
+                            locality = VALUES(locality),
+                            place_type = VALUES(place_type),
+                            category = VALUES(category),
+                            full_response = VALUES(full_response),
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            "geoapify",
+                            query_key,
+                            query,
+                            (language or "en")[:32],
+                            normalized_filter,
+                            self._cache_item_key(
+                                place_id=row.get("place_id"),
+                                name=name,
+                                latitude=float(lat),
+                                longitude=float(lon),
+                            ),
+                            row.get("place_id"),
+                            name,
+                            row.get("formatted"),
+                            subtitle,
+                            float(lat),
+                            float(lon),
+                            country,
+                            (row.get("country_code") or "").upper(),
+                            locality,
+                            row.get("result_type"),
+                            row.get("result_type"),
+                            json.dumps(row, ensure_ascii=False),
+                        ),
+                    )
+
+    def get_place_geocode_cache(self, source: str, query: str, language: str, country_filter_code: str | None, limit: int = 20) -> list[dict] | None:
+        query_key = self._geocode_query_key(source, query, language, country_filter_code)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT place_id, name, address, subtitle,
+                           latitude, longitude, country, country_code, locality, place_type, category
+                    FROM `place_geocode_cache`
+                    WHERE source = %s AND query_key = %s
+                    ORDER BY id
+                    LIMIT %s
+                    """,
+                    (source, query_key, limit),
+                )
+                rows = cur.fetchall()
+                return rows if rows else None
+
+    def get_place_geocode_cache_batch(
+        self,
+        source: str,
+        queries: list[str],
+        language: str,
+        country_filter_code: str | None,
+        limit: int = 20,
+    ) -> dict[str, list[dict]]:
+        unique_queries: list[str] = []
+        query_keys: list[str] = []
+        key_to_query: dict[str, str] = {}
+        seen_keys: set[str] = set()
+
+        for query in queries:
+            query_key = self._geocode_query_key(source, query, language, country_filter_code)
+            if query_key in seen_keys:
+                continue
+            seen_keys.add(query_key)
+            unique_queries.append(query)
+            query_keys.append(query_key)
+            key_to_query[query_key] = query
+
+        if not query_keys:
+            return {}
+
+        placeholders = ",".join(["%s"] * len(query_keys))
+        grouped: dict[str, list[dict]] = {query: [] for query in unique_queries}
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT query_key, place_id, name, address, subtitle,
+                           latitude, longitude, country, country_code, locality, place_type, category
+                    FROM `place_geocode_cache`
+                    WHERE source = %s AND query_key IN ({placeholders})
+                    ORDER BY id
+                    """,
+                    (source, *query_keys),
+                )
+                rows = cur.fetchall()
+
+        for row in rows:
+            query = key_to_query.get(row["query_key"])
+            if not query:
+                continue
+            items = grouped[query]
+            if len(items) >= limit:
+                continue
+            items.append(
+                {
+                    "place_id": row.get("place_id"),
+                    "name": row.get("name"),
+                    "address": row.get("address"),
+                    "subtitle": row.get("subtitle"),
+                    "latitude": row.get("latitude"),
+                    "longitude": row.get("longitude"),
+                    "country": row.get("country"),
+                    "country_code": row.get("country_code"),
+                    "locality": row.get("locality"),
+                    "place_type": row.get("place_type"),
+                    "category": row.get("category"),
+                }
+            )
+
+        return {query: items for query, items in grouped.items() if items}
+
+    def set_place_geocode_cache(
+        self,
+        source: str,
+        query: str,
+        language: str,
+        country_filter_code: str | None,
+        rows: list[dict],
+    ) -> None:
+        query_key = self._geocode_query_key(source, query, language, country_filter_code)
+        normalized_filter = (country_filter_code or "").upper() or None
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                for row in rows:
+                    latitude = row.get("latitude")
+                    longitude = row.get("longitude")
+                    if latitude is None or longitude is None:
+                        continue
+
+                    name = str(row.get("name") or "").strip()
+                    if not name:
+                        continue
+
+                    cur.execute(
+                        """
+                        INSERT INTO `place_geocode_cache`
+                        (source, query_key, query_text, language, country_filter_code, cache_item_key, place_id, name, address, subtitle,
+                         latitude, longitude, country, country_code, locality, place_type, category, full_response)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            name = VALUES(name),
+                            address = VALUES(address),
+                            subtitle = VALUES(subtitle),
+                            latitude = VALUES(latitude),
+                            longitude = VALUES(longitude),
+                            country = VALUES(country),
+                            country_code = VALUES(country_code),
+                            locality = VALUES(locality),
+                            place_type = VALUES(place_type),
+                            category = VALUES(category),
+                            full_response = VALUES(full_response),
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            source,
+                            query_key,
+                            query,
+                            (language or "en")[:32],
+                            normalized_filter,
+                            self._cache_item_key(
+                                place_id=row.get("place_id"),
+                                name=name,
+                                latitude=float(latitude),
+                                longitude=float(longitude),
+                            ),
+                            row.get("place_id"),
+                            name,
+                            row.get("address"),
+                            row.get("subtitle"),
+                            float(latitude),
+                            float(longitude),
+                            row.get("country"),
+                            (row.get("country_code") or "").upper(),
+                            row.get("locality"),
+                            row.get("place_type"),
+                            row.get("category"),
+                            json.dumps(row.get("full_response"), ensure_ascii=False) if row.get("full_response") is not None else None,
+                        ),
+                    )
+
+    def _geocode_query_key(self, source: str, query: str, language: str, country_filter_code: str | None) -> str:
+        payload = "|".join(
+            [
+                source.strip().lower(),
+                query.strip(),
+                (language or "en").strip(),
+                (country_filter_code or "").strip().upper(),
+            ]
+        )
+        return hashlib.md5(payload.encode("utf-8")).hexdigest()
+
+    def _cache_item_key(self, place_id: str | None, name: str, latitude: float, longitude: float) -> str:
+        if place_id:
+            return str(place_id)
+        fallback = f"{name.strip().lower()}|{latitude:.6f}|{longitude:.6f}"
+        return hashlib.md5(fallback.encode("utf-8")).hexdigest()
