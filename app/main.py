@@ -20,6 +20,7 @@ from app.providers.photon import search_photon
 from app.schemas import (
     ParseItineraryRequest,
     ParseItineraryResponse,
+    ParseItineraryResponseNoLocation,
     PlaceResult,
     PlaceSearchMeta,
     PlaceSearchRequest,
@@ -40,6 +41,7 @@ async def lifespan(_: FastAPI):
         cache.cleanup()
     db.ensure_ai_tokens_table()
     db.ensure_ai_parse_cache_table()
+    db.ensure_gaode_cache_table()
     yield
 
 
@@ -518,6 +520,28 @@ async def parse_itinerary_endpoint(request: ParseItineraryRequest) -> ParseItine
 
     try:
         return await parse_itinerary(request.text, request.destination, request.language)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="AI service timeout")
+    except httpx.HTTPStatusError as exc:
+        logger.error("DeepSeek API error: %s %s", exc.response.status_code, exc.response.text[:300])
+        raise HTTPException(status_code=502, detail=f"AI service error: {exc.response.status_code}")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="AI returned invalid JSON response")
+
+
+@app.post("/v1/ai/parse-itinerary-no-geocoding", response_model=ParseItineraryResponseNoLocation)
+async def parse_itinerary_no_geocoding_endpoint(request: ParseItineraryRequest) -> ParseItineraryResponseNoLocation:
+    """Parse itinerary without backend geocoding - for client-side geocoding"""
+    if not settings.ai_parse_enabled:
+        raise HTTPException(status_code=503, detail="AI parsing is disabled")
+
+    from app.ai_service_no_geocoding import parse_itinerary_no_geocoding
+
+    try:
+        # use_cache=False for testing phase
+        return await parse_itinerary_no_geocoding(request.text, request.destination, request.language, use_cache=False)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except httpx.TimeoutException:

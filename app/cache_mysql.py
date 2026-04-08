@@ -148,3 +148,108 @@ class MySQLCache:
                     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
                     """
                 )
+
+    def ensure_gaode_cache_table(self) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS `gaode_geocode_cache` (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        query_key VARCHAR(255) NOT NULL,
+                        query_text VARCHAR(500) NOT NULL,
+                        poi_id VARCHAR(64),
+                        poi_name VARCHAR(255) NOT NULL,
+                        poi_type VARCHAR(100),
+                        poi_typecode VARCHAR(100),
+                        latitude DECIMAL(10, 7) NOT NULL,
+                        longitude DECIMAL(11, 7) NOT NULL,
+                        province VARCHAR(100),
+                        city VARCHAR(100),
+                        district VARCHAR(100),
+                        address TEXT,
+                        full_response JSON,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY idx_query_poi (query_key, poi_id),
+                        INDEX idx_query_key (query_key),
+                        INDEX idx_poi_name (poi_name)
+                    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                    """
+                )
+
+    def get_gaode_cache(self, query: str, limit: int = 20) -> list[dict] | None:
+        """Get cached Gaode results for a query."""
+        import hashlib
+        query_key = hashlib.md5(query.encode('utf-8')).hexdigest()
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT poi_id, poi_name, poi_type, poi_typecode,
+                           latitude, longitude, province, city, district, address
+                    FROM `gaode_geocode_cache`
+                    WHERE query_key = %s
+                    ORDER BY id
+                    LIMIT %s
+                    """,
+                    (query_key, limit),
+                )
+                rows = cur.fetchall()
+                return rows if rows else None
+
+    def set_gaode_cache(self, query: str, pois: list[dict]) -> None:
+        """Cache Gaode API results."""
+        import hashlib
+        query_key = hashlib.md5(query.encode('utf-8')).hexdigest()
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                for poi in pois:
+                    location = poi.get("location", "")
+                    if not location or "," not in location:
+                        continue
+
+                    try:
+                        lon_str, lat_str = location.split(",", 1)
+                        longitude = float(lon_str)
+                        latitude = float(lat_str)
+                    except (ValueError, AttributeError):
+                        continue
+
+                    cur.execute(
+                        """
+                        INSERT INTO `gaode_geocode_cache`
+                        (query_key, query_text, poi_id, poi_name, poi_type, poi_typecode,
+                         latitude, longitude, province, city, district, address, full_response)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            poi_name = VALUES(poi_name),
+                            poi_type = VALUES(poi_type),
+                            poi_typecode = VALUES(poi_typecode),
+                            latitude = VALUES(latitude),
+                            longitude = VALUES(longitude),
+                            province = VALUES(province),
+                            city = VALUES(city),
+                            district = VALUES(district),
+                            address = VALUES(address),
+                            full_response = VALUES(full_response),
+                            updated_at = CURRENT_TIMESTAMP
+                        """,
+                        (
+                            query_key,
+                            query,
+                            poi.get("id"),
+                            poi.get("name", ""),
+                            poi.get("type"),
+                            poi.get("typecode"),
+                            latitude,
+                            longitude,
+                            poi.get("pname"),
+                            poi.get("cityname"),
+                            poi.get("adname"),
+                            poi.get("address"),
+                            json.dumps(poi, ensure_ascii=False),
+                        ),
+                    )

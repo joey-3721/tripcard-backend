@@ -13,6 +13,7 @@ import httpx
 
 from app.cache_mysql import MySQLCache
 from app.config import settings
+from app.providers.gaode import search_gaode
 from app.providers.nominatim import search_nominatim
 from app.providers.photon import search_photon
 from app.schemas import (
@@ -216,6 +217,7 @@ Return ONLY valid JSON, no markdown fences, no explanation. The JSON schema:
   "title": "string - concise trip card title in the original language, e.g. '巴黎48小时深度玩'",
   "destination": "string - primary destination city/region name in the original language",
   "country": "string - country name in the original language if confidently known, else empty string",
+  "countryCode": "string - ISO 3166-1 alpha-2 country code (e.g. 'FR' for France, 'CN' for China, 'US' for USA, 'JP' for Japan), REQUIRED",
   "region": "string - city or region name in the original language if confidently known, else same as destination or empty string",
   "totalDays": number,
   "dayPlans": [
@@ -245,6 +247,7 @@ Return ONLY valid JSON, no markdown fences, no explanation. The JSON schema:
 
 Rules:
 - title should be short and suitable for a trip card
+- countryCode is REQUIRED - you MUST provide the correct ISO 3166-1 alpha-2 country code based on the destination
 - category MUST be one of: attraction, restaurant, hotel, transport, shopping, other
 - Activities MUST be in chronological order within each day
 - searchName MUST be in English and include the city name for accurate geocoding
@@ -344,34 +347,112 @@ async def geocode_single_place(
             limit=5,
         )
 
-        for query in geocode_query_candidates(search_name, title, destination, country):
+        for query in geocode_query_candidates(search_name, title, destination, country, country_code):
             request.query = query
             merged = []
-            try:
-                merged.extend(
-                    await search_nominatim(
+
+            # Use Gaode only for China locations - check both country_code and country name
+            should_use_gaode = False
+            if country_code and country_code.upper() == "CN":
+                should_use_gaode = True
+            elif country and any(cn in country.lower() for cn in ["中国", "china", "中華", "中华"]):
+                should_use_gaode = True
+
+            if should_use_gaode:
+                try:
+                    gaode_results = await search_gaode(
                         client,
                         query,
                         language,
                         request.country_filter_code,
                         request.limit,
                     )
-                )
-            except Exception as exc:
-                logger.warning("geocode nominatim failed query=%s error=%r", query, exc)
+                    if gaode_results:
+                        # Gaode returned results - use ONLY Gaode, do NOT call other providers
+                        merged.extend(gaode_results)
+                    else:
+                        # Gaode returned empty - fallback to other providers
+                        logger.info("gaode returned empty for query=%s, using fallback providers", query)
+                        try:
+                            merged.extend(
+                                await search_nominatim(
+                                    client,
+                                    query,
+                                    language,
+                                    request.country_filter_code,
+                                    request.limit,
+                                )
+                            )
+                        except Exception as exc:
+                            logger.warning("geocode nominatim failed query=%s error=%r", query, exc)
 
-            try:
-                merged.extend(
-                    await search_photon(
-                        client,
-                        query,
-                        "en",
-                        request.country_filter_code,
-                        request.limit,
+                        try:
+                            merged.extend(
+                                await search_photon(
+                                    client,
+                                    query,
+                                    "en",
+                                    request.country_filter_code,
+                                    request.limit,
+                                )
+                            )
+                        except Exception as exc:
+                            logger.warning("geocode photon failed query=%s error=%r", query, exc)
+                except Exception as exc:
+                    logger.warning("geocode gaode failed query=%s error=%r", query, exc)
+                    # Gaode failed - fallback to other providers
+                    try:
+                        merged.extend(
+                            await search_nominatim(
+                                client,
+                                query,
+                                language,
+                                request.country_filter_code,
+                                request.limit,
+                            )
+                        )
+                    except Exception as exc:
+                        logger.warning("geocode nominatim failed query=%s error=%r", query, exc)
+
+                    try:
+                        merged.extend(
+                            await search_photon(
+                                client,
+                                query,
+                                "en",
+                                request.country_filter_code,
+                                request.limit,
+                            )
+                        )
+                    except Exception as exc:
+                        logger.warning("geocode photon failed query=%s error=%r", query, exc)
+            else:
+                # Non-China: use Nominatim and Photon
+                try:
+                    merged.extend(
+                        await search_nominatim(
+                            client,
+                            query,
+                            language,
+                            request.country_filter_code,
+                            request.limit,
+                        )
                     )
-                )
-            except Exception as exc:
-                logger.warning("geocode photon failed query=%s error=%r", query, exc)
+                except Exception as exc:
+                    logger.warning("geocode nominatim failed query=%s error=%r", query, exc)
+
+                try:
+                    merged.extend(
+                        await search_photon(
+                            client,
+                            query,
+                            "en",
+                            request.country_filter_code,
+                            request.limit,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("geocode photon failed query=%s error=%r", query, exc)
 
             ranked = rank_and_convert(merged, request)
             logger.info(
@@ -550,9 +631,9 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
                 category=act.get("category", "other"),
                 location=location,
                 timeBucket=infer_time_bucket(act),
-                startTime=normalize_time_value(act.get("startTime")) or infer_time_range(act.get("notes", ""))[0],
-                endTime=normalize_time_value(act.get("endTime")) or infer_time_range(act.get("notes", ""))[1],
-                notes=act.get("notes", ""),
+                startTime=normalize_time_value(act.get("startTime")) or infer_time_range(act.get("notes") or "")[0],
+                endTime=normalize_time_value(act.get("endTime")) or infer_time_range(act.get("notes") or "")[1],
+                notes=act.get("notes") or "",
                 cost=act.get("cost"),
                 currency=act.get("currency"),
             ))
@@ -561,7 +642,7 @@ async def parse_itinerary(text: str, destination: str | None, language: str) -> 
             id=str(uuid.uuid4()),
             dayNumber=day.get("dayNumber", day_idx + 1),
             activities=activities,
-            notes=day.get("notes", ""),
+            notes=day.get("notes") or "",
         ))
 
     total_days = ai_output.get("totalDays", len(day_plans))
@@ -607,6 +688,7 @@ async def infer_country_code_for_query(
     query: str,
     language: str,
 ) -> str:
+    # Don't use Gaode for country inference - it only returns China results
     for provider in ("nominatim", "photon"):
         try:
             if provider == "nominatim":
@@ -734,34 +816,63 @@ def geocode_query_candidates(
     title: str,
     destination: str | None,
     country: str | None,
+    country_code: str | None = None,
 ) -> list[str]:
     candidates: list[str] = []
-    candidates.extend(rewritten_landmark_queries(search_name))
-    candidates.extend(rewritten_landmark_queries(title))
-    candidates.extend([search_name, title])
 
-    title_base = " ".join((title or "").split())
-    if title_base and destination:
-        candidates.append(f"{title_base} {destination}")
-        if country:
-            candidates.append(f"{title_base} {destination} {country}")
+    # For China, ONLY use Chinese queries
+    is_china = (country_code and country_code.upper() == "CN") or (country and any(cn in country.lower() for cn in ["中国", "china", "中華", "中华"]))
 
-    search_base = " ".join((search_name or "").split())
-    if search_base and destination:
-        candidates.append(f"{search_base} {destination}")
-        if country:
-            candidates.append(f"{search_base} {destination} {country}")
+    if is_china:
+        # For China: ONLY Chinese title, NO English
+        candidates.extend(rewritten_landmark_queries(title))
+        candidates.append(title)
 
-    for base in [simplify_activity_query(title), simplify_activity_query(search_name)]:
-        trimmed_base = " ".join((base or "").split())
-        if not trimmed_base or trimmed_base in {title_base, search_base}:
-            continue
-        if destination:
-            candidates.append(f"{trimmed_base} {destination}")
+        title_base = " ".join((title or "").split())
+        if title_base and destination:
+            candidates.append(f"{title_base} {destination}")
             if country:
-                candidates.append(f"{trimmed_base} {destination} {country}")
-        else:
-            candidates.append(trimmed_base)
+                candidates.append(f"{title_base} {destination} {country}")
+
+        # Add simplified Chinese queries
+        for base in [simplify_activity_query(title)]:
+            trimmed_base = " ".join((base or "").split())
+            if not trimmed_base or trimmed_base == title_base:
+                continue
+            if destination:
+                candidates.append(f"{trimmed_base} {destination}")
+                if country:
+                    candidates.append(f"{trimmed_base} {destination} {country}")
+            else:
+                candidates.append(trimmed_base)
+    else:
+        # For non-China: use English search_name first
+        candidates.extend(rewritten_landmark_queries(search_name))
+        candidates.extend(rewritten_landmark_queries(title))
+        candidates.extend([search_name, title])
+
+        title_base = " ".join((title or "").split())
+        if title_base and destination:
+            candidates.append(f"{title_base} {destination}")
+            if country:
+                candidates.append(f"{title_base} {destination} {country}")
+
+        search_base = " ".join((search_name or "").split())
+        if search_base and destination:
+            candidates.append(f"{search_base} {destination}")
+            if country:
+                candidates.append(f"{search_base} {destination} {country}")
+
+        for base in [simplify_activity_query(title), simplify_activity_query(search_name)]:
+            trimmed_base = " ".join((base or "").split())
+            if not trimmed_base or trimmed_base in {title_base, search_base}:
+                continue
+            if destination:
+                candidates.append(f"{trimmed_base} {destination}")
+                if country:
+                    candidates.append(f"{trimmed_base} {destination} {country}")
+            else:
+                candidates.append(trimmed_base)
 
     deduped: list[str] = []
     seen: set[str] = set()

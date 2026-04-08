@@ -138,3 +138,39 @@ class ParseItineraryResponse(BaseModel):
     dayPlans: list[DayPlanResponse]
     rawAiOutput: dict | None = None
     warnings: list[str] = Field(default_factory=list)
+
+
+# ── AI Itinerary Parsing (Client-side Geocoding) ──
+
+class ActivityResponseNoLocation(BaseModel):
+    """Activity without geocoded location - for client-side geocoding"""
+    id: str
+    title: str
+    searchName: str  # Query string for client to search
+    category: ActivityCategoryType = "other"
+    timeBucket: ActivityTimeBucketType | None = None
+    startTime: str | None = None
+    endTime: str | None = None
+    notes: str = ""
+    cost: float | None = None
+    currency: str | None = None
+
+
+class DayPlanResponseNoLocation(BaseModel):
+    """Day plan without geocoded locations"""
+    id: str
+    dayNumber: int
+    date: str | None = None
+    activities: list[ActivityResponseNoLocation]
+    notes: str = ""
+
+
+class ParseItineraryResponseNoLocation(BaseModel):
+    """Itinerary parsing response without backend geocoding - for client-side geocoding"""
+    destination: str
+    totalDays: int
+    summary: ParseItinerarySummaryResponse | None = None
+    dayPlans: list[DayPlanResponseNoLocation]
+    rawAiOutput: dict | None = None
+    warnings: list[str] = Field(default_factory=list)
+
