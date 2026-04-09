@@ -105,12 +105,10 @@ def build_parse_itinerary_no_geocoding_response(
                     title=title,
                     searchName=search_query,
                     category=act.get("category", "other"),
-                    timeBucket=infer_time_bucket(act),
-                    startTime=normalize_time_value(act.get("startTime"))
-                    or infer_time_range(act.get("notes") or "")[0],
-                    endTime=normalize_time_value(act.get("endTime"))
-                    or infer_time_range(act.get("notes") or "")[1],
-                    notes=sanitize_activity_notes(act.get("notes")),
+                    timeBucket=None,
+                    startTime=None,
+                    endTime=None,
+                    notes="",
                 )
             )
 
@@ -119,7 +117,7 @@ def build_parse_itinerary_no_geocoding_response(
                 id=str(uuid.uuid4()),
                 dayNumber=day.get("dayNumber", day_idx + 1),
                 activities=activities,
-                notes=sanitize_day_notes(day.get("notes"), day.get("activities", [])),
+                notes="",
             )
         )
 

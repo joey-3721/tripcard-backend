@@ -164,14 +164,14 @@ async def parse_itinerary_smart(
                             searchName=activity.searchName,
                             category=activity.category,
                             location=None,
-                            timeBucket=activity.timeBucket,
-                            startTime=activity.startTime,
-                            endTime=activity.endTime,
-                            notes=activity.notes,
+                            timeBucket=None,
+                            startTime=None,
+                            endTime=None,
+                            notes="",
                         )
                         for activity in day.activities
                     ],
-                    notes=day.notes,
+                    notes="",
                 )
                 for day in response.dayPlans
             ],
@@ -221,10 +221,10 @@ async def parse_itinerary_smart(
                     searchName=search_name,
                     category=activity.category,
                     location=activity.location,
-                    timeBucket=activity.timeBucket,
-                    startTime=activity.startTime,
-                    endTime=activity.endTime,
-                    notes=activity.notes,
+                    timeBucket=None,
+                    startTime=None,
+                    endTime=None,
+                    notes="",
                 )
             )
         if should_filter_empty_locations and not filtered_activities:
@@ -236,7 +236,7 @@ async def parse_itinerary_smart(
                 dayNumber=day.dayNumber,
                 date=day.date,
                 activities=filtered_activities,
-                notes=day.notes,
+                notes="",
             )
         )
     warnings = dedupe_warnings(preparse_warnings + response.warnings)
@@ -550,6 +550,8 @@ def build_segment_user_content(text: str, destination: str | None, expected_days
     ]
     if attempt > 1:
         lines.append("Retry carefully: keep dayNumber, activities, title, originalMention, canonicalTitle, searchName, activityType, locationMode, category.")
+    lines.append("Keep timeBucket/startTime/endTime null unless an exact time is explicitly stated.")
+    lines.append("Keep activity notes and day notes empty unless absolutely required for place disambiguation.")
 
     user_content = ""
     if destination:

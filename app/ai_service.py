@@ -239,6 +239,31 @@ CANONICAL_ACTIVITY_RULES: dict[str, dict] = {
     },
 }
 
+COUNTRY_CODE_ENGLISH_NAMES: dict[str, str] = {
+    "AE": "United Arab Emirates",
+    "AU": "Australia",
+    "CA": "Canada",
+    "CN": "China",
+    "EG": "Egypt",
+    "ES": "Spain",
+    "FR": "France",
+    "GB": "United Kingdom",
+    "GR": "Greece",
+    "HK": "Hong Kong",
+    "ID": "Indonesia",
+    "IT": "Italy",
+    "JP": "Japan",
+    "KR": "South Korea",
+    "MO": "Macau",
+    "MY": "Malaysia",
+    "SG": "Singapore",
+    "TH": "Thailand",
+    "TR": "Turkey",
+    "TW": "Taiwan",
+    "US": "United States",
+    "VN": "Vietnam",
+}
+
 SYSTEM_PROMPT = """\
 You are a travel itinerary parser. The user will give you raw travel plan text \
 (possibly in Chinese, English, or mixed). Extract a structured itinerary.
@@ -266,15 +291,15 @@ Return ONLY valid JSON, no markdown fences, no explanation. The JSON schema:
           "placeHint": "string - optional concrete venue/area hint that helps geocoding",
           "boardingPointHint": "string - optional boarding / entry / departure point hint when locationMode=boarding_point_required",
           "category": "attraction|restaurant|hotel|transport|shopping|other",
-          "timeBucket": "morning|noon|afternoon|evening|night|null",
-          "startTime": "HH:MM or null",
-          "endTime": "HH:MM or null",
-          "notes": "short actionable note only if genuinely useful, otherwise empty string",
+          "timeBucket": "null unless an exact time is explicitly stated",
+          "startTime": "null unless an exact time is explicitly stated",
+          "endTime": "null unless an exact time is explicitly stated",
+          "notes": "usually empty string",
           "needsSplit": false,
           "splitActivities": []
         }
       ],
-      "notes": "short day-level note only if it adds value, otherwise empty string"
+      "notes": ""
     }
   ]
 }
@@ -295,13 +320,11 @@ Rules:
 - If the source uses a shorthand or alias such as '国博', '鸟巢', '水立方', '故宫', expand it to the canonical full place name in title/canonicalTitle
 - If the source mentions a compound shorthand that refers to multiple places, such as '清北', '鸟巢水立方', or similar bundled mentions, set needsSplit=true and put multiple fully-formed activities into splitActivities; do not keep the bundled shorthand as a single final place
 - When needsSplit=true, the parent activity is only a container hint and the backend will replace it with splitActivities, so splitActivities must be complete and usable on their own
-- If the text mentions 上午/中午/下午/傍晚/夜晚 or equivalent, fill timeBucket
-- If explicit times like 09:30, 9点半, 14:00-16:00 are present, fill startTime/endTime in 24h HH:MM format
+- Do not spend effort on timeBucket/startTime/endTime; leave them null unless the source states an exact concrete time
 - Do NOT include transport between places as separate activities unless it is a notable activity (e.g. Seine river cruise)
 - Merge nearby/related items into one activity if they are at the same location
-- notes must be distilled, not copied verbatim from the source; only keep reservation requirements, hard time limits, or concrete must-see hints
-- if a note is just generic praise/opinion/filler, return an empty string
-- day notes should usually be empty unless they add non-redundant routing or booking information
+- notes should usually be empty; only keep a note if it is required for geocoding or disambiguation
+- day notes should be empty unless absolutely necessary
 """
 
 
@@ -994,17 +1017,17 @@ async def parse_itinerary_from_ai_output(
                 title=act.get("title", ""),
                 category=act.get("category", "other"),
                 location=location,
-                timeBucket=infer_time_bucket(act),
-                startTime=normalize_time_value(act.get("startTime")) or infer_time_range(act.get("notes") or "")[0],
-                endTime=normalize_time_value(act.get("endTime")) or infer_time_range(act.get("notes") or "")[1],
-                notes=sanitize_activity_notes(act.get("notes")),
+                timeBucket=None,
+                startTime=None,
+                endTime=None,
+                notes="",
             ))
 
         day_plans.append(DayPlanResponse(
             id=str(uuid.uuid4()),
             dayNumber=day.get("dayNumber", day_idx + 1),
             activities=activities,
-            notes=sanitize_day_notes(day.get("notes"), day.get("activities", [])),
+            notes="",
         ))
 
     total_days = ai_output.get("totalDays", len(day_plans))
@@ -1247,6 +1270,7 @@ def geocode_query_candidates(
     search_name_is_ascii_like = bool(search_name) and not bool(cjk_only(compact_match_key(search_name)))
     destination_has_cjk = bool(cjk_only(compact_match_key(destination or "")))
     country_has_cjk = bool(cjk_only(compact_match_key(country or "")))
+    english_country = english_country_name(country, country_code)
 
     # For China, ONLY use Chinese queries
     is_china = (country_code and country_code.upper() == "CN") or (country and any(cn in country.lower() for cn in ["中国", "china", "中華", "中华"]))
@@ -1275,7 +1299,9 @@ def geocode_query_candidates(
                 candidates.append(trimmed_base)
     else:
         destination = destination if not cjk_only(compact_match_key(destination or "")) else None
-        country = country if not cjk_only(compact_match_key(country or "")) else None
+        country = country if not cjk_only(compact_match_key(country or "")) else english_country
+        destination_has_cjk = bool(cjk_only(compact_match_key(destination or "")))
+        country_has_cjk = bool(cjk_only(compact_match_key(country or "")))
         place_hint = place_hint if not cjk_only(compact_match_key(place_hint or "")) else ""
         boarding_point_hint = boarding_point_hint if not cjk_only(compact_match_key(boarding_point_hint or "")) else ""
 
@@ -1320,16 +1346,22 @@ def geocode_query_candidates(
             candidates.append(f"{title_base} {destination}")
             if country and not (country_has_cjk and search_name_is_ascii_like):
                 candidates.append(f"{title_base} {destination} {country}")
+        elif title_base and country and not cjk_only(compact_match_key(title_base)) and not (search_name_is_ascii_like and has_cjk_title):
+            candidates.append(f"{title_base} {country}")
 
         search_base = " ".join((search_name or "").split())
         if search_base and destination and not (destination_has_cjk and search_name_is_ascii_like):
             candidates.append(f"{search_base} {destination}")
             if country and not (country_has_cjk and search_name_is_ascii_like):
                 candidates.append(f"{search_base} {destination} {country}")
+        elif search_base and country and is_ascii_like_text(search_base):
+            candidates.append(f"{search_base} {country}")
         if stripped_lodging_search and destination and not (destination_has_cjk and is_ascii_like_text(stripped_lodging_search)):
             candidates.append(f"{stripped_lodging_search} {destination}")
             if country and not (country_has_cjk and is_ascii_like_text(stripped_lodging_search)):
                 candidates.append(f"{stripped_lodging_search} {destination} {country}")
+        elif stripped_lodging_search and country and is_ascii_like_text(stripped_lodging_search):
+            candidates.append(f"{stripped_lodging_search} {country}")
 
         for base in [simplify_activity_query(search_name), simplify_activity_query(title), stripped_lodging_search, stripped_lodging_title]:
             trimmed_base = " ".join((base or "").split())
@@ -1341,6 +1373,8 @@ def geocode_query_candidates(
                 candidates.append(f"{trimmed_base} {destination}")
                 if country:
                     candidates.append(f"{trimmed_base} {destination} {country}")
+            elif country and is_ascii_like_text(trimmed_base):
+                candidates.append(f"{trimmed_base} {country}")
             else:
                 candidates.append(trimmed_base)
 
@@ -1359,6 +1393,17 @@ def geocode_query_candidates(
         if len(deduped) >= max_candidates:
             break
     return deduped
+
+
+def english_country_name(country: str | None, country_code: str | None) -> str | None:
+    normalized_country = " ".join((country or "").split())
+    if normalized_country and is_ascii_like_text(normalized_country):
+        return normalized_country
+
+    normalized_code = normalize_country_code(country_code)
+    if not normalized_code:
+        return None
+    return COUNTRY_CODE_ENGLISH_NAMES.get(normalized_code)
 
 
 def strip_lodging_suffix(value: str) -> str:
@@ -1619,6 +1664,8 @@ def is_context_consistent_result(item, category: str) -> bool:
         return True
     matched_by = set(getattr(item, "matched_by", []) or [])
     if "destination_context_match" in matched_by:
+        return True
+    if {"name_exact", "name_prefix", "name_contains"} & matched_by:
         return True
     return False
 
