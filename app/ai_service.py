@@ -14,8 +14,10 @@ import httpx
 
 from app.cache_mysql import MySQLCache
 from app.config import settings
+from app.place_query_guard import should_skip_place_query
 from app.providers.gaode import search_gaode
 from app.providers.geoapify import fetch_geoapify_batch, search_geoapify
+from app.providers.google_places import fetch_google_places_batch, search_google_places
 from app.providers.nominatim import search_nominatim
 from app.providers.photon import search_photon
 from app.schemas import (
@@ -309,10 +311,13 @@ def get_ai_token(provider: str = "deepseek") -> dict:
     if row is None:
         raise RuntimeError(f"No enabled AI token found for provider={provider}")
     logger.info(
-        "ai token resolved provider=%s configured_model=%s base_url=%s",
+        "ai token resolved provider=%s configured_model=%s base_url=%s monthly_call_count=%s monthly_limit=%s usage_month=%s",
         provider,
         row.get("model", ""),
         row.get("base_url", ""),
+        row.get("monthly_call_count", 0),
+        row.get("monthly_limit", 0),
+        row.get("usage_month", ""),
     )
     return row
 
@@ -439,9 +444,19 @@ async def geocode_single_place(
     geoapify_results_by_query: dict[str, list] | None = None,
 ) -> TripLocationResponse | None:
     async with semaphore:
-        from app.main import rank_and_convert
+        from app.main import has_acceptable_ranked_results, rank_and_convert
 
         normalized_category = category if category in ("attraction", "restaurant", "hotel", "transport", "shopping", "other") else "other"
+        acceptance_request = request.model_copy(deep=True)
+        acceptance_request.query = search_name
+        if should_skip_place_query(search_name, normalized_category):
+            logger.info(
+                "ai geocode skipped non-place title=%s search=%s category=%s",
+                title,
+                search_name,
+                normalized_category,
+            )
+            return None
         logger.info(
             "ai geocode start title=%s search=%s category=%s destination=%s region=%s country=%s country_code=%s",
             title,
@@ -482,6 +497,7 @@ async def geocode_single_place(
             should_use_gaode = True
 
         effective_geoapify_results_by_query = geoapify_results_by_query
+        effective_google_results_by_query: dict[str, list] | None = None
         if not should_use_gaode and queries:
             if effective_geoapify_results_by_query is None:
                 effective_geoapify_results_by_query = await fetch_geoapify_batches(
@@ -496,10 +512,40 @@ async def geocode_single_place(
                     query: effective_geoapify_results_by_query.get(query, [])
                     for query in queries
                 }
+            if not any(effective_geoapify_results_by_query.get(query, []) for query in queries):
+                effective_google_results_by_query = await fetch_google_batches(
+                    client=client,
+                    queries=queries,
+                    language=language,
+                    country_filter_code=request.country_filter_code,
+                    limit=request.limit,
+                )
 
         for query in queries:
             request.query = query
             merged = []
+            google_attempted = False
+
+            async def extend_google_results() -> None:
+                nonlocal google_attempted, effective_google_results_by_query, merged
+                if google_attempted:
+                    return
+                google_attempted = True
+                if effective_google_results_by_query is None:
+                    effective_google_results_by_query = {}
+                if query not in effective_google_results_by_query:
+                    try:
+                        effective_google_results_by_query[query] = await search_google_places(
+                            client,
+                            query,
+                            language,
+                            request.country_filter_code,
+                            request.limit,
+                        )
+                    except Exception as exc:
+                        logger.warning("geocode google failed query=%s error=%r", query, exc)
+                        effective_google_results_by_query[query] = []
+                merged.extend(effective_google_results_by_query.get(query, []))
 
             if should_use_gaode:
                 try:
@@ -544,8 +590,37 @@ async def geocode_single_place(
                         logger.warning("geocode geoapify failed query=%s error=%r", query, exc)
             else:
                 merged.extend(effective_geoapify_results_by_query.get(query, []))
+                if not merged and effective_google_results_by_query is not None:
+                    await extend_google_results()
 
             ranked = rank_and_convert(merged, request)
+            google_only_unacceptable = (
+                not should_use_gaode
+                and google_attempted
+                and not has_acceptable_ranked_results(ranked, acceptance_request)
+            )
+            geoapify_only_unacceptable = (
+                not should_use_gaode
+                and bool(effective_geoapify_results_by_query.get(query, []))
+                and not google_attempted
+                and not has_acceptable_ranked_results(ranked, acceptance_request)
+            )
+            if geoapify_only_unacceptable:
+                logger.info("ai geocode purging unacceptable geoapify cache query=%s", query)
+                MySQLCache().delete_place_geocode_cache(
+                    source="geoapify",
+                    query=query,
+                    language=language,
+                    country_filter_code=request.country_filter_code,
+                )
+            if google_only_unacceptable:
+                logger.info("ai geocode purging unacceptable google cache query=%s", query)
+                MySQLCache().delete_place_geocode_cache(
+                    source="google",
+                    query=query,
+                    language=language,
+                    country_filter_code=request.country_filter_code,
+                )
             logger.info(
                 "ai geocode candidates title=%s query=%s total=%s top=%s",
                 title,
@@ -554,7 +629,18 @@ async def geocode_single_place(
                 summarize_ranked_candidates(ranked),
             )
             if not ranked:
-                continue
+                if not should_use_gaode and not google_attempted:
+                    await extend_google_results()
+                    ranked = rank_and_convert(merged, request)
+                    logger.info(
+                        "ai geocode google-retry title=%s query=%s total=%s top=%s",
+                        title,
+                        query,
+                        len(ranked),
+                        summarize_ranked_candidates(ranked),
+                    )
+                if not ranked:
+                    continue
 
             best = select_best_geocode_result(
                 ranked,
@@ -567,8 +653,30 @@ async def geocode_single_place(
                 boarding_point_hint=boarding_point_hint,
             )
             if best is None:
-                logger.info("ai geocode no-match title=%s query=%s", title, query)
-                continue
+                if not should_use_gaode and not google_attempted:
+                    await extend_google_results()
+                    ranked = rank_and_convert(merged, request)
+                    logger.info(
+                        "ai geocode google-retry title=%s query=%s total=%s top=%s",
+                        title,
+                        query,
+                        len(ranked),
+                        summarize_ranked_candidates(ranked),
+                    )
+                    if ranked:
+                        best = select_best_geocode_result(
+                            ranked,
+                            search_name=search_name,
+                            title=title,
+                            category=normalized_category,
+                            activity_type=activity_type,
+                            location_mode=location_mode,
+                            place_hint=place_hint,
+                            boarding_point_hint=boarding_point_hint,
+                        )
+                if best is None:
+                    logger.info("ai geocode no-match title=%s query=%s", title, query)
+                    continue
             logger.info(
                 "ai geocode selected title=%s query=%s selected=%s locality=%s country_code=%s score=%s matched_by=%s",
                 title,
@@ -633,6 +741,39 @@ async def fetch_geoapify_batches(
                 )
             except Exception as inner_exc:
                 logger.warning("geocode geoapify failed query=%s error=%r", query, inner_exc)
+                results[query] = []
+        return results
+
+
+async def fetch_google_batches(
+    client: httpx.AsyncClient,
+    queries: list[str],
+    language: str,
+    country_filter_code: str | None,
+    limit: int,
+) -> dict[str, list]:
+    try:
+        return await fetch_google_places_batch(
+            client=client,
+            queries=queries,
+            language=language,
+            country_filter_code=country_filter_code,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.warning("geocode google batch failed error=%r", exc)
+        results: dict[str, list] = {}
+        for query in queries:
+            try:
+                results[query] = await search_google_places(
+                    client,
+                    query,
+                    language,
+                    country_filter_code,
+                    limit,
+                )
+            except Exception as inner_exc:
+                logger.warning("geocode google failed query=%s error=%r", query, inner_exc)
                 results[query] = []
         return results
 
@@ -1084,12 +1225,22 @@ def geocode_query_candidates(
             else:
                 candidates.append(trimmed_base)
     else:
+        destination = destination if not cjk_only(compact_match_key(destination or "")) else None
+        country = country if not cjk_only(compact_match_key(country or "")) else None
+        place_hint = place_hint if not cjk_only(compact_match_key(place_hint or "")) else ""
+        boarding_point_hint = boarding_point_hint if not cjk_only(compact_match_key(boarding_point_hint or "")) else ""
+
         # For non-China: prefer structured English hints first
         candidates.extend(rewritten_landmark_queries(search_name))
         if not search_name_is_ascii_like:
             candidates.extend(rewritten_landmark_queries(title))
 
+        stripped_lodging_search = strip_lodging_suffix(search_name)
+        stripped_lodging_title = strip_lodging_suffix(title)
+
         candidates.extend([search_name, simplify_activity_query(search_name)])
+        if stripped_lodging_search and stripped_lodging_search != search_name:
+            candidates.append(stripped_lodging_search)
         if boarding_point_hint:
             candidates.extend(
                 build_structured_hint_queries(
@@ -1112,7 +1263,7 @@ def geocode_query_candidates(
             )
         if location_mode == "boarding_point_required":
             candidates.extend(build_boarding_queries(search_name, title, destination, country))
-        if not (search_name_is_ascii_like and has_cjk_title):
+        if title and not cjk_only(compact_match_key(title)) and not (search_name_is_ascii_like and has_cjk_title):
             candidates.append(title)
 
         title_base = " ".join((title or "").split())
@@ -1126,8 +1277,12 @@ def geocode_query_candidates(
             candidates.append(f"{search_base} {destination}")
             if country and not (country_has_cjk and search_name_is_ascii_like):
                 candidates.append(f"{search_base} {destination} {country}")
+        if stripped_lodging_search and destination and not (destination_has_cjk and is_ascii_like_text(stripped_lodging_search)):
+            candidates.append(f"{stripped_lodging_search} {destination}")
+            if country and not (country_has_cjk and is_ascii_like_text(stripped_lodging_search)):
+                candidates.append(f"{stripped_lodging_search} {destination} {country}")
 
-        for base in [simplify_activity_query(search_name), simplify_activity_query(title)]:
+        for base in [simplify_activity_query(search_name), simplify_activity_query(title), stripped_lodging_search, stripped_lodging_title]:
             trimmed_base = " ".join((base or "").split())
             if not trimmed_base or trimmed_base in {title_base, search_base}:
                 continue
@@ -1155,6 +1310,20 @@ def geocode_query_candidates(
         if len(deduped) >= max_candidates:
             break
     return deduped
+
+
+def strip_lodging_suffix(value: str) -> str:
+    text = " ".join((value or "").split())
+    if not text:
+        return ""
+    stripped = re.sub(
+        r"\b(?:guest\s*house|guesthouse|hotel|hostel|resort|inn|apartments?|suites?|villa|民宿)\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    stripped = re.sub(r"\s+", " ", stripped).strip(" ,.-")
+    return stripped
 
 
 def build_structured_hint_queries(

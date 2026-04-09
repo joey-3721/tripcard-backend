@@ -15,9 +15,11 @@ from opencc import OpenCC
 
 from app.cache_mysql import MySQLCache
 from app.config import settings
+from app.place_query_guard import should_skip_place_query
 from app.providers.base import ProviderPlace
 from app.providers.gaode import search_gaode
 from app.providers.geoapify import fetch_geoapify_batch, search_geoapify
+from app.providers.google_places import fetch_google_places_batch, search_google_places
 from app.schemas import (
     ParseItineraryRequest,
     ParseItineraryResponse,
@@ -93,6 +95,21 @@ async def execute_place_search(
                 self_hosted_data=False,
             ),
         )
+    if should_skip_place_query(query, request.category):
+        logger.info("place-search skipped non-place query=%s category=%s", query, request.category)
+        return PlaceSearchResponse(
+            query=request.query,
+            trace_id=trace_id,
+            results=[],
+            meta=PlaceSearchMeta(
+                scope=request.scope,
+                country_filter_code=request.country_filter_code,
+                preferred_country_codes=request.preferred_country_codes,
+                providers_used=[],
+                cache_hit=False,
+                self_hosted_data=False,
+            ),
+        )
 
     cache_key = build_cache_key(request, variant="geoapify_only" if geoapify_only else "default")
     if cache is not None:
@@ -105,6 +122,7 @@ async def execute_place_search(
     context_queries = build_queries(query, request)
     providers_used: list[str] = []
     merged: list[ProviderPlace] = []
+    fallback_used = False
 
     headers = {"User-Agent": settings.user_agent}
     timeout = httpx.Timeout(settings.request_timeout_seconds)
@@ -128,10 +146,22 @@ async def execute_place_search(
                     logger.warning("gaode failed query=%s error=%r", candidate, exc)
         else:
             geoapify_batches = await fetch_geoapify_place_search_batches(client, context_queries, request)
-            for candidate in context_queries:
-                merged.extend(geoapify_batches.get(candidate, []))
-            if any(geoapify_batches.values()):
+            geoapify_acceptable = has_acceptable_batch_results(geoapify_batches, request, context_queries)
+            if geoapify_acceptable:
+                for candidate in context_queries:
+                    merged.extend(geoapify_batches.get(candidate, []))
                 providers_used.append("geoapify")
+            elif not geoapify_only:
+                purge_unacceptable_provider_cache("geoapify", geoapify_batches, request, context_queries)
+                google_batches = await fetch_google_place_search_batches(client, context_queries, request)
+                google_acceptable = has_acceptable_batch_results(google_batches, request, context_queries)
+                if google_acceptable:
+                    for candidate in context_queries:
+                        merged.extend(google_batches.get(candidate, []))
+                    providers_used.append("google")
+                    fallback_used = True
+                else:
+                    purge_unacceptable_provider_cache("google", google_batches, request, context_queries)
 
     results = rank_and_convert(merged, request)
     response = PlaceSearchResponse(
@@ -139,15 +169,15 @@ async def execute_place_search(
         trace_id=trace_id,
         results=results[: request.limit],
         meta=PlaceSearchMeta(
-            scope=request.scope,
-            country_filter_code=request.country_filter_code,
-            preferred_country_codes=request.preferred_country_codes,
-            fallback_used=False,
-            providers_used=providers_used,
-            cache_hit=False,
-            self_hosted_data=False,
-        ),
-    )
+                scope=request.scope,
+                country_filter_code=request.country_filter_code,
+                preferred_country_codes=request.preferred_country_codes,
+                fallback_used=fallback_used,
+                providers_used=providers_used,
+                cache_hit=False,
+                self_hosted_data=False,
+            ),
+        )
     if cache is not None and response.results:
         cache.set(
             cache_key,
@@ -190,15 +220,51 @@ async def fetch_geoapify_place_search_batches(
         return batches
 
 
+async def fetch_google_place_search_batches(
+    client: httpx.AsyncClient,
+    context_queries: list[str],
+    request: PlaceSearchRequest,
+) -> dict[str, list[ProviderPlace]]:
+    try:
+        return await fetch_google_places_batch(
+            client=client,
+            queries=context_queries,
+            language=request.language,
+            country_filter_code=request.country_filter_code,
+            limit=request.limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("google places batch failed error=%r", exc)
+        batches: dict[str, list[ProviderPlace]] = {}
+        for query in context_queries:
+            try:
+                batches[query] = await search_google_places(
+                    client,
+                    query,
+                    request.language,
+                    request.country_filter_code,
+                    request.limit,
+                )
+            except Exception as inner_exc:  # noqa: BLE001
+                logger.warning("google places failed query=%s error=%r", query, inner_exc)
+                if isinstance(inner_exc, httpx.HTTPStatusError):
+                    logger.warning("google places response body=%s", inner_exc.response.text[:400])
+                batches[query] = []
+        return batches
+
+
 def build_queries(query: str, request: PlaceSearchRequest) -> list[str]:
     queries = [query]
     destinations = request.destination_context.destinations if request.destination_context else []
+    is_china = should_use_china_provider(request)
     context_parts: list[str] = []
     for item in destinations[:4]:
-        if item.name.strip():
-            context_parts.append(item.name.strip())
-        if item.country.strip():
-            context_parts.append(item.country.strip())
+        name = item.name.strip()
+        country = item.country.strip()
+        if name and (is_china or not contains_cjk_text(name)):
+            context_parts.append(name)
+        if country and (is_china or not contains_cjk_text(country)):
+            context_parts.append(country)
 
     if context_parts:
         context = " ".join(dict.fromkeys(context_parts))
@@ -225,7 +291,7 @@ def should_use_china_provider(request: PlaceSearchRequest) -> bool:
 
 def build_cache_key(request: PlaceSearchRequest, variant: str = "default") -> str:
     payload = json.dumps(
-        {"cache_version": 4, "variant": variant, **request.model_dump(mode="json")},
+        {"cache_version": 7, "variant": variant, **request.model_dump(mode="json")},
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -361,6 +427,95 @@ def rank_and_convert(items: list[ProviderPlace], request: PlaceSearchRequest) ->
             )
         )
     return results
+
+
+def has_acceptable_batch_results(
+    batches: dict[str, list[ProviderPlace]],
+    request: PlaceSearchRequest,
+    context_queries: list[str],
+) -> bool:
+    for candidate in context_queries:
+        candidate_items = batches.get(candidate, [])
+        if not candidate_items:
+            continue
+        candidate_request = request.model_copy(deep=True)
+        candidate_request.query = candidate
+        ranked = rank_and_convert(candidate_items, candidate_request)
+        acceptance_request = request.model_copy(deep=True)
+        if has_acceptable_ranked_results(ranked, acceptance_request):
+            return True
+    return False
+
+
+def purge_unacceptable_provider_cache(
+    source: str,
+    batches: dict[str, list[ProviderPlace]],
+    request: PlaceSearchRequest,
+    context_queries: list[str],
+) -> None:
+    for candidate in context_queries:
+        candidate_items = batches.get(candidate, [])
+        if not candidate_items:
+            continue
+        candidate_request = request.model_copy(deep=True)
+        candidate_request.query = candidate
+        ranked = rank_and_convert(candidate_items, candidate_request)
+        acceptance_request = request.model_copy(deep=True)
+        if has_acceptable_ranked_results(ranked, acceptance_request):
+            continue
+        logger.info("purging unacceptable provider cache source=%s query=%s", source, candidate)
+        db.delete_place_geocode_cache(
+            source=source,
+            query=candidate,
+            language=request.language,
+            country_filter_code=request.country_filter_code,
+        )
+
+
+def has_acceptable_ranked_results(results: list[PlaceResult], request: PlaceSearchRequest) -> bool:
+    if not results:
+        return False
+
+    top = results[0]
+    matched = set(top.matched_by or [])
+    has_name_signal = bool({"name_exact", "name_prefix", "name_contains"} & matched)
+    has_address_signal = "address_contains" in matched
+    has_context_signal = "destination_context_match" in matched and "preferred_country_boost" in matched
+    query_token_count = len(normalize(request.query).split())
+    is_named_lookup = request.category in {"hotel", "restaurant", "shopping"} or query_token_count >= 2
+
+    if has_name_signal:
+        return True
+    if request.category in {"hotel", "restaurant", "shopping"}:
+        return has_meaningful_name_overlap(request.query, top.name)
+    if is_named_lookup:
+        return has_address_signal and (top.score or 0) >= 0.72
+    return has_address_signal or has_context_signal
+
+
+def has_meaningful_name_overlap(query: str, candidate_name: str | None) -> bool:
+    normalized_query = normalize(query)
+    normalized_name = normalize(candidate_name or "")
+    if not normalized_query or not normalized_name:
+        return False
+    if normalized_query == normalized_name:
+        return True
+
+    query_tokens = {token for token in normalized_query.split() if token}
+    name_tokens = {token for token in normalized_name.split() if token}
+    if not query_tokens or not name_tokens:
+        return False
+
+    overlap = query_tokens & name_tokens
+    if not overlap:
+        return False
+
+    minimum_overlap = 2 if len(query_tokens) >= 2 else 1
+    if len(overlap) < minimum_overlap:
+        return False
+
+    coverage = len(overlap) / max(1, min(len(query_tokens), len(name_tokens)))
+    return coverage >= 0.6
 
 
 def ranking_tuple(
@@ -570,6 +725,11 @@ def has_strong_nominatim_match(
 
 def compact_text(text: str) -> str:
     return normalize(text).replace(" ", "")
+
+
+def contains_cjk_text(text: str | None) -> bool:
+    value = str(text or "")
+    return any("\u4e00" <= ch <= "\u9fff" for ch in value)
 
 
 def destination_context_match(item: ProviderPlace, request: PlaceSearchRequest) -> bool:

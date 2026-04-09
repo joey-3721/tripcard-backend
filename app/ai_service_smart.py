@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -19,6 +20,7 @@ from app.ai_service import (
     parse_itinerary_from_ai_output,
 )
 from app.ai_service_no_geocoding import build_parse_itinerary_no_geocoding_response
+from app.cache_mysql import MySQLCache
 from app.config import settings
 from app.schemas import (
     ActivityResponseSmart,
@@ -67,6 +69,7 @@ SEGMENTATION_EXPLICIT_DAY_THRESHOLD = 3
 SEGMENT_PARSE_CONCURRENCY = 6
 SEGMENT_PARSE_RETRIES = 2
 SEGMENT_MAX_EXPECTED_DAYS = 2
+SMART_PARSE_CACHE_VERSION = 1
 
 
 async def parse_itinerary_smart(
@@ -77,6 +80,31 @@ async def parse_itinerary_smart(
 ) -> ParseItinerarySmartResponse:
     started_at = time.perf_counter()
     provider = normalize_ai_provider(model_name)
+    cache_key = build_smart_parse_cache_key(
+        text=text,
+        destination=destination,
+        language=language,
+        provider=provider,
+    )
+    db = MySQLCache()
+    cached_response = db.get_ai_cache(cache_key)
+    if cached_response is not None:
+        response = ParseItinerarySmartResponse.model_validate(cached_response)
+        logger.info(
+            "parse-itinerary-smart cache hit provider=%s destination=%s language=%s elapsed=%.3fs",
+            provider,
+            destination or "",
+            language,
+            time.perf_counter() - started_at,
+        )
+        return response
+
+    logger.info(
+        "parse-itinerary-smart cache miss provider=%s destination=%s language=%s",
+        provider,
+        destination or "",
+        language,
+    )
     token_info = get_ai_token(provider)
     ai_output, preparse_warnings, segmented = await resolve_ai_output_smart(
         text=text,
@@ -116,16 +144,7 @@ async def parse_itinerary_smart(
         response = build_parse_itinerary_no_geocoding_response(ai_output=ai_output, destination=destination)
         warnings = dedupe_warnings(preparse_warnings + response.warnings)
         total_elapsed = time.perf_counter() - started_at
-        logger.info(
-            "parse-itinerary-smart response provider=%s segmented=%s geocoding_mode=%s ai_elapsed=%.3fs total_elapsed=%.3fs payload=%s",
-            provider,
-            segmented,
-            "client_apple",
-            ai_elapsed,
-            total_elapsed,
-            json.dumps(response.model_dump(mode="json"), ensure_ascii=False),
-        )
-        return ParseItinerarySmartResponse(
+        smart_response = ParseItinerarySmartResponse(
             destination=response.destination,
             totalDays=response.totalDays,
             summary=response.summary,
@@ -155,6 +174,20 @@ async def parse_itinerary_smart(
             warnings=warnings,
             geocodingMode="client_apple",
         )
+        db.set_ai_cache(
+            cache_key,
+            json.loads(smart_response.model_dump_json()),
+        )
+        logger.info(
+            "parse-itinerary-smart response provider=%s segmented=%s geocoding_mode=%s ai_elapsed=%.3fs total_elapsed=%.3fs payload=%s",
+            provider,
+            segmented,
+            "client_apple",
+            ai_elapsed,
+            total_elapsed,
+            json.dumps(smart_response.model_dump(mode="json"), ensure_ascii=False),
+        )
+        return smart_response
 
     no_geocoding_response = build_parse_itinerary_no_geocoding_response(ai_output=ai_output, destination=destination)
     response = await parse_itinerary_from_ai_output(
@@ -163,50 +196,95 @@ async def parse_itinerary_smart(
         language=language,
         preserve_unresolved=True,
     )
+    should_filter_empty_locations = resolved_country_code.upper() != "CN"
+    filtered_day_plans: list[DayPlanResponseSmart] = []
+    dropped_activity_count = 0
+    dropped_day_count = 0
+    for day_index, day in enumerate(response.dayPlans):
+        filtered_activities: list[ActivityResponseSmart] = []
+        paired_no_geo_activities = no_geocoding_response.dayPlans[day_index].activities if day_index < len(no_geocoding_response.dayPlans) else []
+        for activity_index, activity in enumerate(day.activities):
+            if should_filter_empty_locations and activity.location is None:
+                dropped_activity_count += 1
+                continue
+            search_name = paired_no_geo_activities[activity_index].searchName if activity_index < len(paired_no_geo_activities) else None
+            filtered_activities.append(
+                ActivityResponseSmart(
+                    id=activity.id,
+                    title=activity.title,
+                    searchName=search_name,
+                    category=activity.category,
+                    location=activity.location,
+                    timeBucket=activity.timeBucket,
+                    startTime=activity.startTime,
+                    endTime=activity.endTime,
+                    notes=activity.notes,
+                )
+            )
+        if should_filter_empty_locations and not filtered_activities:
+            dropped_day_count += 1
+            continue
+        filtered_day_plans.append(
+            DayPlanResponseSmart(
+                id=day.id,
+                dayNumber=day.dayNumber,
+                date=day.date,
+                activities=filtered_activities,
+                notes=day.notes,
+            )
+        )
     warnings = dedupe_warnings(preparse_warnings + response.warnings)
+    if should_filter_empty_locations and dropped_activity_count:
+        warnings.append(f"Filtered {dropped_activity_count} activity items without coordinates before returning to client.")
+    if should_filter_empty_locations and dropped_day_count:
+        warnings.append(f"Filtered {dropped_day_count} empty day plans after coordinate cleanup.")
+    warnings = dedupe_warnings(warnings)
     total_elapsed = time.perf_counter() - started_at
+    smart_response = ParseItinerarySmartResponse(
+        destination=response.destination,
+        totalDays=response.totalDays,
+        summary=response.summary,
+        dayPlans=filtered_day_plans,
+        warnings=warnings,
+        geocodingMode="backend_geoapify",
+    )
+    db.set_ai_cache(
+        cache_key,
+        json.loads(smart_response.model_dump_json()),
+    )
     logger.info(
-        "parse-itinerary-smart response provider=%s segmented=%s geocoding_mode=%s ai_elapsed=%.3fs total_elapsed=%.3fs payload=%s",
+        "parse-itinerary-smart response provider=%s segmented=%s geocoding_mode=%s ai_elapsed=%.3fs total_elapsed=%.3fs dropped_activities=%s dropped_days=%s payload=%s",
         provider,
         segmented,
         "backend_geoapify",
         ai_elapsed,
         total_elapsed,
-        json.dumps(response.model_dump(mode="json"), ensure_ascii=False),
+        dropped_activity_count,
+        dropped_day_count,
+        json.dumps(smart_response.model_dump(mode="json"), ensure_ascii=False),
     )
-    return ParseItinerarySmartResponse(
-        destination=response.destination,
-        totalDays=response.totalDays,
-        summary=response.summary,
-        dayPlans=[
-            DayPlanResponseSmart(
-                id=day.id,
-                dayNumber=day.dayNumber,
-                date=day.date,
-                activities=[
-                    ActivityResponseSmart(
-                        id=activity.id,
-                        title=activity.title,
-                        searchName=no_geo_activity.searchName,
-                        category=activity.category,
-                        location=activity.location,
-                        timeBucket=activity.timeBucket,
-                        startTime=activity.startTime,
-                        endTime=activity.endTime,
-                        notes=activity.notes,
-                    )
-                    for activity, no_geo_activity in zip(
-                        day.activities,
-                        no_geocoding_response.dayPlans[day_index].activities,
-                    )
-                ],
-                notes=day.notes,
-            )
-            for day_index, day in enumerate(response.dayPlans)
-        ],
-        warnings=warnings,
-        geocodingMode="backend_geoapify",
+    return smart_response
+
+
+def build_smart_parse_cache_key(
+    *,
+    text: str,
+    destination: str | None,
+    language: str,
+    provider: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "cache_version": SMART_PARSE_CACHE_VERSION,
+            "text": text,
+            "destination": destination,
+            "language": language,
+            "provider": provider,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
     )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 async def resolve_ai_output_smart(
