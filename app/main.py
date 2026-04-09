@@ -467,12 +467,10 @@ def purge_unacceptable_provider_cache(
         acceptance_request = request.model_copy(deep=True)
         if has_acceptable_ranked_results(ranked, acceptance_request):
             continue
-        logger.info("purging unacceptable provider cache source=%s query=%s", source, candidate)
-        db.delete_place_geocode_cache(
-            source=source,
-            query=candidate,
-            language=request.language,
-            country_filter_code=request.country_filter_code,
+        logger.info(
+            "保留未采用的提供方缓存 source=%s query=%s 原因=缓存表仅追加不删除",
+            source,
+            candidate,
         )
 
 

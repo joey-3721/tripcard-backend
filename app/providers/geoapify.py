@@ -30,6 +30,7 @@ async def fetch_geoapify_batch(
     language: str,
     country_filter_code: str | None,
     limit: int,
+    api_enabled: bool = True,
 ) -> dict[str, list[ProviderPlace]]:
     deduped_queries: list[str] = []
     seen_queries: set[str] = set()
@@ -57,17 +58,19 @@ async def fetch_geoapify_batch(
     for query in deduped_queries:
         cached_results = cached_rows_by_query.get(query) or []
         if cached_results:
-            logger.info("geoapify cache hit query=%s results=%d", query, len(cached_results))
+            logger.info("Geoapify 缓存命中 query=%s 条数=%d", query, len(cached_results))
             results[query] = [row_to_provider_place(row) for row in cached_results]
         else:
             missing_queries.append(query)
 
-    if not missing_queries:
+    if not missing_queries or not api_enabled:
+        for query in missing_queries:
+            results[query] = []
         return results
 
     token_row = db.get_ai_token("geoapify")
     if token_row is None:
-        logger.warning("geoapify token not found in database")
+        logger.warning("Geoapify token 未在数据库中配置")
         for query in missing_queries:
             results[query] = []
         return results
@@ -90,9 +93,9 @@ async def fetch_geoapify_batch(
         try:
             results[query] = await tasks[query]
         except Exception as exc:
-            logger.warning("geoapify api failed query=%s error=%r", query, exc)
+            logger.warning("Geoapify 接口请求失败 query=%s error=%r", query, exc)
             if isinstance(exc, httpx.HTTPStatusError):
-                logger.warning("geoapify response body=%s", exc.response.text[:300])
+                logger.warning("Geoapify 响应体=%s", exc.response.text[:300])
             results[query] = []
     return results
 
@@ -108,11 +111,11 @@ async def _search_geoapify_api(
 ) -> list[ProviderPlace]:
     usage = db.increment_ai_provider_usage("geoapify")
     if usage is None:
-        logger.warning("geoapify usage row missing when querying=%s", query)
+        logger.warning("Geoapify 用量配置缺失 query=%s", query)
         return []
     if not usage.get("allowed", False):
         logger.warning(
-            "geoapify daily limit reached query=%s usage=%s/%s date=%s reason=%s",
+            "Geoapify 当日额度不可用 query=%s 用量=%s/%s 日期=%s 原因=%s",
             query,
             usage.get("daily_call_count", 0),
             usage.get("daily_limit", -1),
@@ -184,7 +187,7 @@ async def _search_geoapify_api(
                 rows=cache_rows,
             )
         logger.info(
-            "geoapify api call query=%s results=%d usage=%s/%s date=%s cached",
+            "Geoapify 接口查询完成并写入缓存 query=%s 结果数=%d 今日用量=%s/%s 日期=%s",
             query,
             len(rows),
             usage.get("daily_call_count", 0),

@@ -560,14 +560,14 @@ async def geocode_single_place(
         normalized_category = category if category in ("attraction", "restaurant", "hotel", "transport", "shopping", "other") else "other"
         if should_skip_place_query(search_name, normalized_category):
             logger.info(
-                "ai geocode skipped non-place title=%s search=%s category=%s",
+                "AI 地理解析跳过非地点条目 title=%s search=%s category=%s",
                 title,
                 search_name,
                 normalized_category,
             )
             return None
         logger.info(
-            "ai geocode start title=%s search=%s category=%s destination=%s region=%s country=%s country_code=%s",
+            "AI 地理解析开始 title=%s search=%s category=%s destination=%s region=%s country=%s country_code=%s",
             title,
             search_name,
             normalized_category,
@@ -607,44 +607,78 @@ async def geocode_single_place(
         elif country and any(cn in country.lower() for cn in ["中国", "china", "中華", "中华"]):
             should_use_gaode = True
 
-        effective_geoapify_results_by_query = geoapify_results_by_query
-        effective_google_results_by_query: dict[str, list] | None = None
+        effective_geoapify_results_by_query: dict[str, list] = {}
+        cached_google_results_by_query: dict[str, list] = {}
+        effective_google_results_by_query: dict[str, list] = {}
         if not should_use_gaode and queries:
-            if effective_geoapify_results_by_query is None:
-                effective_geoapify_results_by_query = await fetch_geoapify_batches(
-                    client=client,
-                    queries=queries,
-                    language=language,
-                    country_filter_code=request.country_filter_code,
-                    limit=request.limit,
+            cached_geoapify_results_by_query = await fetch_geoapify_batches(
+                client=client,
+                queries=queries,
+                language=language,
+                country_filter_code=request.country_filter_code,
+                limit=request.limit,
+                api_enabled=False,
+            )
+            cached_google_results_by_query = await fetch_google_batches(
+                client=client,
+                queries=queries,
+                language=language,
+                country_filter_code=request.country_filter_code,
+                limit=request.limit,
+                api_enabled=False,
+            )
+            effective_google_results_by_query = dict(cached_google_results_by_query)
+            prefetched_geoapify_results = geoapify_results_by_query or {}
+            effective_geoapify_results_by_query = {
+                query: (
+                    cached_geoapify_results_by_query.get(query, [])
+                    or prefetched_geoapify_results.get(query, [])
+                    or []
                 )
-            else:
-                effective_geoapify_results_by_query = {
-                    query: effective_geoapify_results_by_query.get(query, [])
-                    for query in queries
-                }
-            if not any(effective_geoapify_results_by_query.get(query, []) for query in queries):
-                effective_google_results_by_query = await fetch_google_batches(
-                    client=client,
-                    queries=queries,
-                    language=language,
-                    country_filter_code=request.country_filter_code,
-                    limit=request.limit,
-                )
+                for query in queries
+            }
+            logger.info(
+                "AI 地理解析已读取缓存 title=%s Geoapify命中=%d Google命中=%d 候选查询数=%d",
+                title,
+                sum(1 for query in queries if cached_geoapify_results_by_query.get(query)),
+                sum(1 for query in queries if cached_google_results_by_query.get(query)),
+                len(queries),
+            )
 
         for query in queries:
             request.query = query
             merged = []
             google_attempted = False
+            google_cache_exists = bool(cached_google_results_by_query.get(query, []))
 
-            async def extend_google_results() -> None:
+            async def extend_google_results(allow_api_lookup: bool) -> None:
                 nonlocal google_attempted, effective_google_results_by_query, merged
                 if google_attempted:
                     return
                 google_attempted = True
-                if effective_google_results_by_query is None:
-                    effective_google_results_by_query = {}
-                if query not in effective_google_results_by_query:
+                cached_google_results = effective_google_results_by_query.get(query, [])
+                if cached_google_results:
+                    logger.info(
+                        "AI 地理解析使用 Google 缓存 query=%s title=%s 条数=%d",
+                        query,
+                        title,
+                        len(cached_google_results),
+                    )
+                    merged.extend(cached_google_results)
+                    return
+                if not allow_api_lookup:
+                    logger.info(
+                        "AI 地理解析跳过 Google 接口 query=%s title=%s 原因=Google已有缓存结论或策略不允许继续补查",
+                        query,
+                        title,
+                    )
+                    return
+                logger.info(
+                    "AI 地理解析开始请求 Google 接口 query=%s title=%s 原因=Google无缓存",
+                    query,
+                    title,
+                )
+                if query not in effective_google_results_by_query or not effective_google_results_by_query.get(query):
                     try:
                         effective_google_results_by_query[query] = await search_google_places(
                             client,
@@ -654,7 +688,7 @@ async def geocode_single_place(
                             request.limit,
                         )
                     except Exception as exc:
-                        logger.warning("geocode google failed query=%s error=%r", query, exc)
+                        logger.warning("AI 地理解析请求 Google 失败 query=%s error=%r", query, exc)
                         effective_google_results_by_query[query] = []
                 merged.extend(effective_google_results_by_query.get(query, []))
 
@@ -671,7 +705,7 @@ async def geocode_single_place(
                         # Gaode returned results - use ONLY Gaode, do NOT call other providers
                         merged.extend(gaode_results)
                     else:
-                        logger.info("gaode returned empty for query=%s, using geoapify fallback", query)
+                        logger.info("高德返回空结果 query=%s，改用 Geoapify 补查", query)
                         try:
                             merged.extend(
                                 await search_geoapify(
@@ -683,9 +717,9 @@ async def geocode_single_place(
                                 )
                             )
                         except Exception as exc:
-                            logger.warning("geocode geoapify failed query=%s error=%r", query, exc)
+                            logger.warning("AI 地理解析请求 Geoapify 失败 query=%s error=%r", query, exc)
                 except Exception as exc:
-                    logger.warning("geocode gaode failed query=%s error=%r", query, exc)
+                    logger.warning("AI 地理解析请求高德失败 query=%s error=%r", query, exc)
                     # Gaode failed - fallback to overseas provider
                     try:
                         merged.extend(
@@ -698,42 +732,20 @@ async def geocode_single_place(
                             )
                         )
                     except Exception as exc:
-                        logger.warning("geocode geoapify failed query=%s error=%r", query, exc)
+                        logger.warning("AI 地理解析请求 Geoapify 失败 query=%s error=%r", query, exc)
             else:
                 merged.extend(effective_geoapify_results_by_query.get(query, []))
-                if not merged and effective_google_results_by_query is not None:
-                    await extend_google_results()
+                if effective_geoapify_results_by_query.get(query):
+                    logger.info(
+                        "AI 地理解析使用 Geoapify 缓存 query=%s title=%s 条数=%d",
+                        query,
+                        title,
+                        len(effective_geoapify_results_by_query.get(query, [])),
+                    )
 
             ranked = rank_and_convert(merged, request)
-            google_only_unacceptable = (
-                not should_use_gaode
-                and google_attempted
-                and not has_acceptable_ranked_results(ranked, acceptance_request)
-            )
-            geoapify_only_unacceptable = (
-                not should_use_gaode
-                and bool(effective_geoapify_results_by_query.get(query, []))
-                and not google_attempted
-                and not has_acceptable_ranked_results(ranked, acceptance_request)
-            )
-            if geoapify_only_unacceptable:
-                logger.info("ai geocode purging unacceptable geoapify cache query=%s", query)
-                MySQLCache().delete_place_geocode_cache(
-                    source="geoapify",
-                    query=query,
-                    language=language,
-                    country_filter_code=request.country_filter_code,
-                )
-            if google_only_unacceptable:
-                logger.info("ai geocode purging unacceptable google cache query=%s", query)
-                MySQLCache().delete_place_geocode_cache(
-                    source="google",
-                    query=query,
-                    language=language,
-                    country_filter_code=request.country_filter_code,
-                )
             logger.info(
-                "ai geocode candidates title=%s query=%s total=%s top=%s",
+                "AI 地理解析候选结果 title=%s query=%s 总数=%s top=%s",
                 title,
                 query,
                 len(ranked),
@@ -741,10 +753,10 @@ async def geocode_single_place(
             )
             if not ranked:
                 if not should_use_gaode and not google_attempted:
-                    await extend_google_results()
+                    await extend_google_results(allow_api_lookup=not google_cache_exists)
                     ranked = rank_and_convert(merged, request)
                     logger.info(
-                        "ai geocode google-retry title=%s query=%s total=%s top=%s",
+                        "AI 地理解析补充 Google 后重排 title=%s query=%s 总数=%s top=%s",
                         title,
                         query,
                         len(ranked),
@@ -765,10 +777,14 @@ async def geocode_single_place(
             )
             if best is None:
                 if not should_use_gaode and not google_attempted:
-                    await extend_google_results()
+                    should_call_google_api = (
+                        not google_cache_exists
+                        and not has_acceptable_ranked_results(ranked, acceptance_request)
+                    )
+                    await extend_google_results(allow_api_lookup=should_call_google_api)
                     ranked = rank_and_convert(merged, request)
                     logger.info(
-                        "ai geocode google-retry title=%s query=%s total=%s top=%s",
+                        "AI 地理解析补充 Google 后重排 title=%s query=%s 总数=%s top=%s",
                         title,
                         query,
                         len(ranked),
@@ -786,10 +802,10 @@ async def geocode_single_place(
                             boarding_point_hint=boarding_point_hint,
                         )
                 if best is None:
-                    logger.info("ai geocode no-match title=%s query=%s", title, query)
+                    logger.info("AI 地理解析未命中 title=%s query=%s", title, query)
                     continue
             logger.info(
-                "ai geocode selected title=%s query=%s selected=%s locality=%s country_code=%s score=%s matched_by=%s",
+                "AI 地理解析命中 title=%s query=%s selected=%s locality=%s country_code=%s score=%s matched_by=%s",
                 title,
                 query,
                 best.name,
@@ -800,7 +816,7 @@ async def geocode_single_place(
             )
             if not is_context_consistent_result(best, normalized_category):
                 logger.info(
-                    "ai geocode reject title=%s query=%s selected=%s reason=destination_context_mismatch matched_by=%s",
+                    "AI 地理解析结果被上下文剔除 title=%s query=%s selected=%s reason=destination_context_mismatch matched_by=%s",
                     title,
                     query,
                     best.name,
@@ -819,7 +835,7 @@ async def geocode_single_place(
                 category=normalized_category,
             )
 
-        logger.info("ai geocode unresolved title=%s search=%s", title, search_name)
+        logger.info("AI 地理解析最终未解析 title=%s search=%s", title, search_name)
         return None
 
 
@@ -829,6 +845,7 @@ async def fetch_geoapify_batches(
     language: str,
     country_filter_code: str | None,
     limit: int,
+    api_enabled: bool = True,
 ) -> dict[str, list]:
     try:
         return await fetch_geoapify_batch(
@@ -837,11 +854,15 @@ async def fetch_geoapify_batches(
             language=language,
             country_filter_code=country_filter_code,
             limit=limit,
+            api_enabled=api_enabled,
         )
     except Exception as exc:
-        logger.warning("geocode geoapify batch failed error=%r", exc)
+        logger.warning("Geoapify 批量查询失败 error=%r", exc)
         results: dict[str, list] = {}
         for query in queries:
+            if not api_enabled:
+                results[query] = []
+                continue
             try:
                 results[query] = await search_geoapify(
                     client,
@@ -851,7 +872,7 @@ async def fetch_geoapify_batches(
                     limit,
                 )
             except Exception as inner_exc:
-                logger.warning("geocode geoapify failed query=%s error=%r", query, inner_exc)
+                logger.warning("Geoapify 单条查询失败 query=%s error=%r", query, inner_exc)
                 results[query] = []
         return results
 
@@ -862,6 +883,7 @@ async def fetch_google_batches(
     language: str,
     country_filter_code: str | None,
     limit: int,
+    api_enabled: bool = True,
 ) -> dict[str, list]:
     try:
         return await fetch_google_places_batch(
@@ -870,11 +892,15 @@ async def fetch_google_batches(
             language=language,
             country_filter_code=country_filter_code,
             limit=limit,
+            api_enabled=api_enabled,
         )
     except Exception as exc:
-        logger.warning("geocode google batch failed error=%r", exc)
+        logger.warning("Google Places 批量查询失败 error=%r", exc)
         results: dict[str, list] = {}
         for query in queries:
+            if not api_enabled:
+                results[query] = []
+                continue
             try:
                 results[query] = await search_google_places(
                     client,
@@ -884,7 +910,7 @@ async def fetch_google_batches(
                     limit,
                 )
             except Exception as inner_exc:
-                logger.warning("geocode google failed query=%s error=%r", query, inner_exc)
+                logger.warning("Google Places 单条查询失败 query=%s error=%r", query, inner_exc)
                 results[query] = []
         return results
 

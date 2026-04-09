@@ -41,6 +41,7 @@ async def fetch_google_places_batch(
     language: str,
     country_filter_code: str | None,
     limit: int,
+    api_enabled: bool = True,
 ) -> dict[str, list[ProviderPlace]]:
     deduped_queries: list[str] = []
     seen_queries: set[str] = set()
@@ -68,17 +69,19 @@ async def fetch_google_places_batch(
     for query in deduped_queries:
         cached_results = cached_rows_by_query.get(query) or []
         if cached_results:
-            logger.info("google places cache hit query=%s results=%d", query, len(cached_results))
+            logger.info("Google Places 缓存命中 query=%s 条数=%d", query, len(cached_results))
             results[query] = [row_to_provider_place(row) for row in cached_results]
         else:
             missing_queries.append(query)
 
-    if not missing_queries:
+    if not missing_queries or not api_enabled:
+        for query in missing_queries:
+            results[query] = []
         return results
 
     token_row = db.get_ai_token("google")
     if token_row is None:
-        logger.warning("google token not found in database")
+        logger.warning("Google Places token 未在数据库中配置")
         for query in missing_queries:
             results[query] = []
         return results
@@ -101,9 +104,9 @@ async def fetch_google_places_batch(
         try:
             results[query] = await tasks[query]
         except Exception as exc:
-            logger.warning("google places api failed query=%s error=%r", query, exc)
+            logger.warning("Google Places 接口请求失败 query=%s error=%r", query, exc)
             if isinstance(exc, httpx.HTTPStatusError):
-                logger.warning("google places response body=%s", exc.response.text[:400])
+                logger.warning("Google Places 响应体=%s", exc.response.text[:400])
             results[query] = []
     return results
 
@@ -119,11 +122,11 @@ async def _search_google_places_api(
 ) -> list[ProviderPlace]:
     usage = db.increment_ai_provider_usage("google")
     if usage is None:
-        logger.warning("google usage row missing when querying=%s", query)
+        logger.warning("Google Places 用量配置缺失 query=%s", query)
         return []
     if not usage.get("allowed", False):
         logger.warning(
-            "google limit reached query=%s monthly=%s/%s month=%s daily=%s/%s date=%s reason=%s",
+            "Google Places 额度不可用 query=%s 月用量=%s/%s 月份=%s 日用量=%s/%s 日期=%s 原因=%s",
             query,
             usage.get("monthly_call_count", 0),
             usage.get("monthly_limit", -1),
@@ -190,7 +193,7 @@ async def _search_google_places_api(
         )
 
     logger.info(
-        "google places api call query=%s results=%d monthly=%s/%s month=%s daily=%s/%s date=%s",
+        "Google Places 接口查询完成并写入缓存 query=%s 结果数=%d 月用量=%s/%s 月份=%s 日用量=%s/%s 日期=%s",
         query,
         len(items),
         usage.get("monthly_call_count", 0),

@@ -849,25 +849,6 @@ class MySQLCache:
                         ),
                     )
 
-    def delete_place_geocode_cache(
-        self,
-        source: str,
-        query: str,
-        language: str,
-        country_filter_code: str | None,
-    ) -> None:
-        query_key = self._geocode_query_key(source, query, language, country_filter_code)
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    DELETE FROM `place_geocode_cache`
-                    WHERE source = %s
-                      AND query_key = %s
-                    """,
-                    (source, query_key),
-                )
-
     def get_ai_job(self, task_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
