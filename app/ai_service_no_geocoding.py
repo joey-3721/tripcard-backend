@@ -6,11 +6,11 @@ import logging
 import uuid
 
 from app.ai_service import (
-    SYSTEM_PROMPT,
     get_ai_token,
-    call_deepseek,
+    call_ai_model,
     normalize_day_plans_raw,
     normalize_country_code,
+    normalize_ai_provider,
     normalized_summary_title,
     sanitize_activity_notes,
     standardized_activity_title,
@@ -31,17 +31,22 @@ logger = logging.getLogger("tripcard-backend")
 
 
 async def parse_itinerary_no_geocoding(
-    text: str, destination: str | None, language: str, use_cache: bool = False
+    text: str,
+    destination: str | None,
+    language: str,
+    model_name: str = "deepseek",
+    use_cache: bool = False,
 ) -> ParseItineraryResponseNoLocation:
     """Parse itinerary without backend geocoding - returns search queries for client-side geocoding"""
-    token_info = get_ai_token("deepseek")
+    provider = normalize_ai_provider(model_name)
+    token_info = get_ai_token(provider)
 
-    # Check DeepSeek output cache (optional)
+    # Check AI output cache (optional)
     ai_output = None
     if use_cache:
         cache_key = hashlib.sha256(
             json.dumps(
-                {"cache_version": 8, "text": text, "destination": destination},
+                {"cache_version": 9, "text": text, "destination": destination, "provider": provider},
                 ensure_ascii=False,
                 sort_keys=True,
             ).encode()
@@ -49,21 +54,22 @@ async def parse_itinerary_no_geocoding(
         db = MySQLCache()
         ai_output = db.get_ai_cache(cache_key)
         if ai_output:
-            logger.info("ai parse cache hit destination=%s", destination or "")
+            logger.info("ai parse cache hit provider=%s destination=%s", provider, destination or "")
 
     if ai_output is None:
-        ai_output = await call_deepseek(text, destination, token_info)
+        ai_output = await call_ai_model(text, destination, token_info, provider)
         if use_cache:
             db = MySQLCache()
             db.set_ai_cache(cache_key, ai_output)
-        logger.info("ai parse cache miss destination=%s", destination or "")
+        logger.info("ai parse cache miss provider=%s destination=%s", provider, destination or "")
 
     response = build_parse_itinerary_no_geocoding_response(
         ai_output=ai_output,
         destination=destination,
     )
     logger.info(
-        "parse-itinerary-no-geocoding frontend response=%s",
+        "parse-itinerary-no-geocoding frontend response provider=%s payload=%s",
+        provider,
         json.dumps(response.model_dump(mode="json"), ensure_ascii=False),
     )
     return response

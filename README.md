@@ -30,7 +30,7 @@ cp .env.example .env
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 2778
+
 
 ```
 
@@ -48,7 +48,7 @@ HTTP_PROXY=http://你的NAS代理IP:端口
 HTTPS_PROXY=http://你的NAS代理IP:端口
 NO_PROXY=127.0.0.1,localhost
 ```
-
+python3 -m uvicorn app.main:app --reload --host 0.0.0.0 --port 2778
 ## MySQL 缓存
 
 服务启动时会自动在 `travel` 库里创建缓存表：

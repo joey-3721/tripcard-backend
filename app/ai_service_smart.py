@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import httpx
 
 from app.ai_service import (
-    call_deepseek,
+    call_ai_model,
     get_ai_token,
     infer_country_code,
     normalize_country_code,
+    normalize_ai_provider,
     parse_itinerary_from_ai_output,
 )
 from app.ai_service_no_geocoding import build_parse_itinerary_no_geocoding_response
@@ -26,9 +28,11 @@ async def parse_itinerary_smart(
     text: str,
     destination: str | None,
     language: str,
+    model_name: str = "deepseek",
 ) -> ParseItinerarySmartResponse:
-    token_info = get_ai_token("deepseek")
-    ai_output = await call_deepseek(text, destination, token_info)
+    provider = normalize_ai_provider(model_name)
+    token_info = get_ai_token(provider)
+    ai_output = await call_ai_model(text, destination, token_info, provider)
 
     resolved_destination = ai_output.get("destination", destination or "")
     resolved_region = ai_output.get("region", resolved_destination)
@@ -51,6 +55,12 @@ async def parse_itinerary_smart(
 
     if resolved_country_code.upper() == "CN":
         response = build_parse_itinerary_no_geocoding_response(ai_output=ai_output, destination=destination)
+        logger.info(
+            "parse-itinerary-smart response provider=%s geocoding_mode=%s payload=%s",
+            provider,
+            "client_apple",
+            json.dumps(response.model_dump(mode="json"), ensure_ascii=False),
+        )
         return ParseItinerarySmartResponse(
             destination=response.destination,
             totalDays=response.totalDays,
@@ -83,6 +93,12 @@ async def parse_itinerary_smart(
         )
 
     response = await parse_itinerary_from_ai_output(ai_output=ai_output, destination=destination, language=language)
+    logger.info(
+        "parse-itinerary-smart response provider=%s geocoding_mode=%s payload=%s",
+        provider,
+        "backend_geoapify",
+        json.dumps(response.model_dump(mode="json"), ensure_ascii=False),
+    )
     return ParseItinerarySmartResponse(
         destination=response.destination,
         totalDays=response.totalDays,

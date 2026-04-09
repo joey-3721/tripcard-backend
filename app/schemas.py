@@ -88,6 +88,10 @@ class ParseItineraryRequest(BaseModel):
         description="Primary destination hint, e.g. '巴黎' or 'Paris, France'",
     )
     language: str = "zh-CN"
+    modelName: str = Field(
+        default="deepseek",
+        description="AI model selector from client, e.g. 'deepseek' or 'qwen-turbo'",
+    )
 
 
 class TripLocationResponse(BaseModel):

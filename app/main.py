@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from opencc import OpenCC
 
 from app.cache_mysql import MySQLCache
 from app.config import settings
@@ -32,6 +33,7 @@ logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.I
 logger = logging.getLogger("tripcard-backend")
 cache = MySQLCache() if settings.cache_enabled else None
 db = MySQLCache()  # for ai_tokens table operations
+opencc_t2s = OpenCC("t2s")
 
 
 @asynccontextmanager
@@ -63,6 +65,18 @@ async def health() -> dict[str, str]:
 
 @app.post("/v1/place-search", response_model=PlaceSearchResponse)
 async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
+    return await execute_place_search(request, geoapify_only=False)
+
+
+@app.post("/v1/place-search-geoapify", response_model=PlaceSearchResponse)
+async def place_search_geoapify(request: PlaceSearchRequest) -> PlaceSearchResponse:
+    return await execute_place_search(request, geoapify_only=True)
+
+
+async def execute_place_search(
+    request: PlaceSearchRequest,
+    geoapify_only: bool,
+) -> PlaceSearchResponse:
     trace_id = str(uuid.uuid4())
     query = request.query.strip()
     if not query:
@@ -80,7 +94,7 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
             ),
         )
 
-    cache_key = build_cache_key(request)
+    cache_key = build_cache_key(request, variant="geoapify_only" if geoapify_only else "default")
     if cache is not None:
         cached = cache.get(cache_key)
         if cached is not None:
@@ -96,7 +110,7 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
     timeout = httpx.Timeout(settings.request_timeout_seconds)
     async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
         use_china_provider = should_use_china_provider(request)
-        if use_china_provider:
+        if use_china_provider and not geoapify_only:
             for candidate in context_queries:
                 try:
                     merged.extend(
@@ -118,7 +132,6 @@ async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
                 merged.extend(geoapify_batches.get(candidate, []))
             if any(geoapify_batches.values()):
                 providers_used.append("geoapify")
-
 
     results = rank_and_convert(merged, request)
     response = PlaceSearchResponse(
@@ -210,9 +223,67 @@ def should_use_china_provider(request: PlaceSearchRequest) -> bool:
     return False
 
 
-def build_cache_key(request: PlaceSearchRequest) -> str:
-    payload = json.dumps({"cache_version": 3, **request.model_dump(mode="json")}, ensure_ascii=False, sort_keys=True)
+def build_cache_key(request: PlaceSearchRequest, variant: str = "default") -> str:
+    payload = json.dumps(
+        {"cache_version": 4, "variant": variant, **request.model_dump(mode="json")},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def to_simplified_place_text(text: str) -> str:
+    return unicodedata.normalize("NFKC", opencc_t2s.convert(text))
+
+
+def canonicalize_place_text(text: str) -> str:
+    simplified = to_simplified_place_text(text)
+    simplified = re.sub(r"\s+", " ", simplified).strip(" ,，；;")
+    return simplified.casefold()
+
+
+def split_address_tokens(text: str) -> list[str]:
+    return [
+        token.strip()
+        for token in re.split(r"[,，]", text)
+        if token and token.strip()
+    ]
+
+
+def sanitize_place_text(text: str | None) -> str | None:
+    if text is None:
+        return None
+
+    raw = re.sub(r"[；﹔]+", ";", str(text))
+    parts = [part.strip(" ,，；;") for part in raw.split(";")]
+    cleaned_parts: list[str] = []
+    seen_keys: set[str] = set()
+    seen_token_keys: set[str] = set()
+
+    for part in parts:
+        if not part:
+            continue
+
+        key = canonicalize_place_text(part)
+        if not key or key in seen_keys or key in seen_token_keys:
+            continue
+
+        part_token_keys = {
+            canonicalize_place_text(token)
+            for token in split_address_tokens(part)
+            if canonicalize_place_text(token)
+        }
+        if key in seen_token_keys:
+            continue
+
+        cleaned_parts.append(to_simplified_place_text(part).strip(" ,，；;"))
+        seen_keys.add(key)
+        seen_token_keys.update(part_token_keys)
+
+    if not cleaned_parts:
+        return None
+    return "; ".join(cleaned_parts)
+
 
 def rank_and_convert(items: list[ProviderPlace], request: PlaceSearchRequest) -> list[PlaceResult]:
     preferred_codes = {code.upper() for code in request.preferred_country_codes if code}
@@ -265,16 +336,22 @@ def rank_and_convert(items: list[ProviderPlace], request: PlaceSearchRequest) ->
             continue
         seen.add(dedupe_key)
 
+        sanitized_name = sanitize_place_text(item.name) or item.name
+        sanitized_subtitle = sanitize_place_text(item.subtitle)
+        sanitized_address = sanitize_place_text(item.address)
+        sanitized_country = sanitize_place_text(item.country)
+        sanitized_locality = sanitize_place_text(item.locality)
+
         results.append(
             PlaceResult(
                 id=f"{item.provider}|{item.provider_place_id or dedupe_key}",
-                name=item.name,
-                subtitle=item.subtitle,
-                address=item.address,
+                name=sanitized_name,
+                subtitle=sanitized_subtitle,
+                address=sanitized_address,
                 coordinate={"latitude": item.latitude, "longitude": item.longitude},
-                country=item.country,
+                country=sanitized_country,
                 country_code=item.country_code,
-                locality=item.locality,
+                locality=sanitized_locality or "",
                 place_type=item.place_type,
                 category=request.category,
                 provider=item.provider,
@@ -547,13 +624,18 @@ async def parse_itinerary_endpoint(request: ParseItineraryRequest) -> ParseItine
     from app.ai_service import parse_itinerary
 
     try:
-        return await parse_itinerary(request.text, request.destination, request.language)
+        return await parse_itinerary(request.text, request.destination, request.language, request.modelName)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="AI service timeout")
     except httpx.HTTPStatusError as exc:
-        logger.error("DeepSeek API error: %s %s", exc.response.status_code, exc.response.text[:300])
+        logger.error(
+            "AI API error model=%s status=%s body=%s",
+            request.modelName,
+            exc.response.status_code,
+            exc.response.text,
+        )
         raise HTTPException(status_code=502, detail=f"AI service error: {exc.response.status_code}")
     except json.JSONDecodeError:
         raise HTTPException(status_code=502, detail="AI returned invalid JSON response")
@@ -569,13 +651,24 @@ async def parse_itinerary_no_geocoding_endpoint(request: ParseItineraryRequest) 
 
     try:
         # use_cache=False for testing phase
-        return await parse_itinerary_no_geocoding(request.text, request.destination, request.language, use_cache=False)
+        return await parse_itinerary_no_geocoding(
+            request.text,
+            request.destination,
+            request.language,
+            request.modelName,
+            use_cache=False,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="AI service timeout")
     except httpx.HTTPStatusError as exc:
-        logger.error("DeepSeek API error: %s %s", exc.response.status_code, exc.response.text[:300])
+        logger.error(
+            "AI API error model=%s status=%s body=%s",
+            request.modelName,
+            exc.response.status_code,
+            exc.response.text,
+        )
         raise HTTPException(status_code=502, detail=f"AI service error: {exc.response.status_code}")
     except json.JSONDecodeError:
         raise HTTPException(status_code=502, detail="AI returned invalid JSON response")
@@ -589,13 +682,18 @@ async def parse_itinerary_smart_endpoint(request: ParseItineraryRequest) -> Pars
     from app.ai_service_smart import parse_itinerary_smart
 
     try:
-        return await parse_itinerary_smart(request.text, request.destination, request.language)
+        return await parse_itinerary_smart(request.text, request.destination, request.language, request.modelName)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="AI service timeout")
     except httpx.HTTPStatusError as exc:
-        logger.error("DeepSeek API error: %s %s", exc.response.status_code, exc.response.text[:300])
+        logger.error(
+            "AI API error model=%s status=%s body=%s",
+            request.modelName,
+            exc.response.status_code,
+            exc.response.text,
+        )
         raise HTTPException(status_code=502, detail=f"AI service error: {exc.response.status_code}")
     except json.JSONDecodeError:
         raise HTTPException(status_code=502, detail="AI returned invalid JSON response")

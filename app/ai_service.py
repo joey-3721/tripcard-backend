@@ -306,11 +306,33 @@ def get_ai_token(provider: str = "deepseek") -> dict:
     db = MySQLCache()
     row = db.get_ai_token(provider)
     if row is None:
-        raise RuntimeError("No enabled AI token found")
+        raise RuntimeError(f"No enabled AI token found for provider={provider}")
+    logger.info(
+        "ai token resolved provider=%s configured_model=%s base_url=%s",
+        provider,
+        row.get("model", ""),
+        row.get("base_url", ""),
+    )
     return row
 
 
-async def call_deepseek(text: str, destination: str | None, token_info: dict) -> dict:
+def normalize_ai_provider(model_name: str | None) -> str:
+    normalized = (model_name or "deepseek").strip().lower()
+    alias_map = {
+        "deepseek": "deepseek",
+        "deepseek-chat": "deepseek",
+        "qwen": "qwen-turbo",
+        "qwen-turbo": "qwen-turbo",
+    }
+    return alias_map.get(normalized, normalized or "deepseek")
+
+
+async def call_ai_model(
+    text: str,
+    destination: str | None,
+    token_info: dict,
+    provider: str,
+) -> dict:
     user_content = ""
     if destination:
         user_content += f"Destination context: {destination}\n\n"
@@ -334,13 +356,26 @@ async def call_deepseek(text: str, destination: str | None, token_info: dict) ->
     }
 
     timeout = httpx.Timeout(settings.ai_request_timeout_seconds)
+    logger.info(
+        "ai request provider=%s configured_model=%s base_url=%s destination=%s text_length=%s",
+        provider,
+        token_info["model"],
+        base_url,
+        destination or "",
+        len(text),
+    )
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{base_url}/v1/chat/completions", json=payload, headers=headers)
         resp.raise_for_status()
 
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
-    logger.info("deepseek raw response content=%s", content)
+    logger.info(
+        "ai raw response provider=%s configured_model=%s content=%s",
+        provider,
+        token_info["model"],
+        content,
+    )
 
     # Strip markdown fences if present
     content = re.sub(r"^```(?:json)?\s*", "", content.strip())
@@ -348,7 +383,9 @@ async def call_deepseek(text: str, destination: str | None, token_info: dict) ->
 
     parsed_content = json.loads(content)
     logger.info(
-        "deepseek parsed response=%s",
+        "ai parsed response provider=%s configured_model=%s payload=%s",
+        provider,
+        token_info["model"],
         json.dumps(parsed_content, ensure_ascii=False),
     )
     return parsed_content
@@ -570,11 +607,17 @@ async def fetch_geoapify_batches(
         return results
 
 
-async def parse_itinerary(text: str, destination: str | None, language: str) -> ParseItineraryResponse:
-    token_info = get_ai_token("deepseek")
+async def parse_itinerary(
+    text: str,
+    destination: str | None,
+    language: str,
+    model_name: str = "deepseek",
+) -> ParseItineraryResponse:
+    provider = normalize_ai_provider(model_name)
+    token_info = get_ai_token(provider)
 
-    ai_output = await call_deepseek(text, destination, token_info)
-    logger.info("ai parse no-cache destination=%s", destination or "")
+    ai_output = await call_ai_model(text, destination, token_info, provider)
+    logger.info("ai parse no-cache provider=%s destination=%s", provider, destination or "")
     return await parse_itinerary_from_ai_output(ai_output, destination, language)
 
 
