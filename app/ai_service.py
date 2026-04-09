@@ -447,8 +447,6 @@ async def geocode_single_place(
         from app.main import has_acceptable_ranked_results, rank_and_convert
 
         normalized_category = category if category in ("attraction", "restaurant", "hotel", "transport", "shopping", "other") else "other"
-        acceptance_request = request.model_copy(deep=True)
-        acceptance_request.query = search_name
         if should_skip_place_query(search_name, normalized_category):
             logger.info(
                 "ai geocode skipped non-place title=%s search=%s category=%s",
@@ -477,6 +475,8 @@ async def geocode_single_place(
             language=language,
             limit=5,
         )
+        acceptance_request = request.model_copy(deep=True)
+        acceptance_request.query = search_name
         queries = geocode_query_candidates(
             search_name,
             title,
