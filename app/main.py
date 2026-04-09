@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
-import unicodedata
 import uuid
+import unicodedata
 from contextlib import asynccontextmanager
 
 import httpx
@@ -24,6 +25,8 @@ from app.schemas import (
     ParseItineraryRequest,
     ParseItineraryResponse,
     ParseItineraryResponseNoLocation,
+    ParseItineraryAsyncStartResponse,
+    ParseItineraryAsyncStatusResponse,
     ParseItinerarySmartResponse,
     PlaceResult,
     PlaceSearchMeta,
@@ -46,6 +49,7 @@ async def lifespan(_: FastAPI):
         cache.cleanup()
     db.ensure_ai_tokens_table()
     db.ensure_ai_parse_cache_table()
+    db.ensure_ai_parse_jobs_table()
     db.ensure_place_geocode_cache_table()
     yield
 
@@ -857,3 +861,102 @@ async def parse_itinerary_smart_endpoint(request: ParseItineraryRequest) -> Pars
         raise HTTPException(status_code=502, detail=f"AI service error: {exc.response.status_code}")
     except json.JSONDecodeError:
         raise HTTPException(status_code=502, detail="AI returned invalid JSON response")
+
+
+@app.post("/v1/ai/parse-itinerary-smart/async", response_model=ParseItineraryAsyncStartResponse)
+async def parse_itinerary_smart_async_start_endpoint(request: ParseItineraryRequest) -> ParseItineraryAsyncStartResponse:
+    if not settings.ai_parse_enabled:
+        raise HTTPException(status_code=503, detail="AI parsing is disabled")
+
+    from app.ai_service_smart import build_smart_parse_cache_key, parse_itinerary_smart
+    from app.ai_service import normalize_ai_provider
+
+    provider = normalize_ai_provider(request.modelName)
+    cache_key = build_smart_parse_cache_key(
+        text=request.text,
+        destination=request.destination,
+        language=request.language,
+        provider=provider,
+    )
+    cached = db.get_ai_cache(cache_key)
+    if cached is not None:
+        return ParseItineraryAsyncStartResponse(
+            status="completed",
+            progress=100,
+            message="已命中缓存",
+            cacheHit=True,
+            result=ParseItinerarySmartResponse.model_validate(cached),
+        )
+
+    active_job = db.get_active_ai_job_by_cache_key(cache_key)
+    if active_job is not None:
+        return ParseItineraryAsyncStartResponse(
+            taskId=active_job["task_id"],
+            status=active_job["status"],
+            progress=int(active_job.get("progress") or 0),
+            message=active_job.get("message") or "任务进行中",
+            cacheHit=False,
+        )
+
+    task_id = uuid.uuid4().hex
+    db.set_ai_job(
+        task_id=task_id,
+        cache_key=cache_key,
+        provider=provider,
+        language=request.language,
+        request_payload=request.model_dump(mode="json"),
+        status="queued",
+        progress=0,
+        message="任务已创建",
+    )
+
+    async def run_job() -> None:
+        try:
+            db.update_ai_job_progress(task_id, status="processing", progress=2, message="准备开始解析")
+
+            async def progress_callback(progress: int, message: str) -> None:
+                db.update_ai_job_progress(task_id, status="processing", progress=progress, message=message)
+
+            result = await parse_itinerary_smart(
+                request.text,
+                request.destination,
+                request.language,
+                request.modelName,
+                progress_callback=progress_callback,
+            )
+            db.update_ai_job_progress(task_id, status="completed", progress=100, message="解析完成")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("async parse-itinerary-smart job failed task_id=%s", task_id)
+            db.update_ai_job_progress(
+                task_id,
+                status="failed",
+                progress=100,
+                message="解析失败",
+                error_message=str(exc),
+            )
+
+    asyncio.create_task(run_job())
+    return ParseItineraryAsyncStartResponse(
+        taskId=task_id,
+        status="queued",
+        progress=0,
+        message="任务已创建",
+        cacheHit=False,
+    )
+
+
+@app.get("/v1/ai/parse-itinerary-smart/async/{task_id}", response_model=ParseItineraryAsyncStatusResponse)
+async def parse_itinerary_smart_async_status_endpoint(task_id: str) -> ParseItineraryAsyncStatusResponse:
+    job = db.get_ai_job(task_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    result = db.get_ai_cache(job["cache_key"]) if job["status"] == "completed" else None
+    return ParseItineraryAsyncStatusResponse(
+        taskId=job["task_id"],
+        status=job["status"],
+        progress=int(job.get("progress") or 0),
+        message=job.get("message") or "",
+        result=ParseItinerarySmartResponse.model_validate(result) if result is not None else None,
+        error=job.get("error_message"),
+    )

@@ -797,6 +797,8 @@ async def parse_itinerary_from_ai_output(
     destination: str | None,
     language: str,
     preserve_unresolved: bool = False,
+    progress_callback=None,
+    progress_range: tuple[int, int] = (60, 100),
 ) -> ParseItineraryResponse:
     resolved_destination = ai_output.get("destination", destination or "")
     resolved_region = ai_output.get("region", resolved_destination)
@@ -887,27 +889,68 @@ async def parse_itinerary_from_ai_output(
                     country_filter_code=resolved_country_code or None,
                     limit=5,
                 )
-        coros = [
-            geocode_single_place(
-                client,
-                search_name=name,
-                title=title or original_mention,
-                activity_type=activity_type,
-                location_mode=location_mode,
-                place_hint=place_hint,
-                boarding_point_hint=boarding_point_hint,
-                destination=resolved_destination,
-                region=resolved_region,
-                country=resolved_country,
-                country_code=resolved_country_code,
-                category=cat,
-                language=language,
-                semaphore=semaphore,
-                geoapify_results_by_query=prefetched_geoapify_results,
+        async def run_geocode_task(
+            task_index: int,
+            name: str,
+            title: str,
+            original_mention: str,
+            cat: str,
+            activity_type: str,
+            location_mode: str,
+            place_hint: str,
+            boarding_point_hint: str,
+        ) -> tuple[int, TripLocationResponse | None | Exception]:
+            try:
+                location = await geocode_single_place(
+                    client,
+                    search_name=name,
+                    title=title or original_mention,
+                    activity_type=activity_type,
+                    location_mode=location_mode,
+                    place_hint=place_hint,
+                    boarding_point_hint=boarding_point_hint,
+                    destination=resolved_destination,
+                    region=resolved_region,
+                    country=resolved_country,
+                    country_code=resolved_country_code,
+                    category=cat,
+                    language=language,
+                    semaphore=semaphore,
+                    geoapify_results_by_query=prefetched_geoapify_results,
+                )
+                return task_index, location
+            except Exception as exc:  # noqa: BLE001
+                return task_index, exc
+
+        tasks = [
+            asyncio.create_task(
+                run_geocode_task(
+                    task_index=index,
+                    name=name,
+                    title=title,
+                    original_mention=original_mention,
+                    cat=cat,
+                    activity_type=activity_type,
+                    location_mode=location_mode,
+                    place_hint=place_hint,
+                    boarding_point_hint=boarding_point_hint,
+                )
             )
-            for name, title, original_mention, cat, activity_type, location_mode, place_hint, boarding_point_hint in geocode_tasks
+            for index, (name, title, original_mention, cat, activity_type, location_mode, place_hint, boarding_point_hint) in enumerate(geocode_tasks)
         ]
-        locations = await asyncio.gather(*coros, return_exceptions=True)
+        locations: list[TripLocationResponse | None | Exception] = [None] * len(tasks)
+        total_locations = len(tasks)
+        progress_start, progress_end = progress_range
+        if total_locations <= 0:
+            await emit_parse_progress(progress_callback, progress_end, "地点识别完成")
+        else:
+            completed_locations = 0
+            for finished_task in asyncio.as_completed(tasks):
+                task_index, location = await finished_task
+                locations[task_index] = location
+                completed_locations += 1
+                progress = progress_start + int((completed_locations / total_locations) * max(1, progress_end - progress_start))
+                await emit_parse_progress(progress_callback, progress, f"地点识别 {completed_locations}/{total_locations}")
 
     # Map geocoded locations back
     location_map: dict[tuple[int, int], TripLocationResponse | None] = {}
@@ -980,6 +1023,12 @@ async def parse_itinerary_from_ai_output(
         dayPlans=day_plans,
         warnings=warnings,
     )
+
+
+async def emit_parse_progress(progress_callback, progress: int, message: str) -> None:
+    if progress_callback is None:
+        return
+    await progress_callback(max(0, min(100, int(progress))), message)
 
 
 async def infer_country_code(

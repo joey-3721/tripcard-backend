@@ -263,6 +263,29 @@ class MySQLCache:
                     """
                 )
 
+    def ensure_ai_parse_jobs_table(self) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS `ai_parse_jobs` (
+                        task_id VARCHAR(64) PRIMARY KEY,
+                        cache_key VARCHAR(64) NOT NULL,
+                        provider VARCHAR(32) NOT NULL,
+                        language VARCHAR(32) NOT NULL DEFAULT 'zh-CN',
+                        status VARCHAR(16) NOT NULL DEFAULT 'queued',
+                        progress INT NOT NULL DEFAULT 0,
+                        message VARCHAR(255) NOT NULL DEFAULT '',
+                        error_message TEXT NULL,
+                        request_payload LONGTEXT NULL,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_cache_key_status (cache_key, status),
+                        INDEX idx_created_at (created_at)
+                    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                    """
+                )
+
     def ensure_gaode_cache_table(self) -> None:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -316,6 +339,7 @@ class MySQLCache:
                         locality VARCHAR(120),
                         place_type VARCHAR(120),
                         category VARCHAR(120),
+                        hit_count INT NOT NULL DEFAULT 0,
                         full_response JSON,
                         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -331,6 +355,12 @@ class MySQLCache:
                     MODIFY COLUMN `cache_item_key` VARCHAR(255) NOT NULL,
                     MODIFY COLUMN `place_id` VARCHAR(512) NULL
                     """
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name="place_geocode_cache",
+                    column_name="hit_count",
+                    definition="INT NOT NULL DEFAULT 0",
                 )
 
     def get_gaode_cache(self, query: str, limit: int = 20) -> list[dict] | None:
@@ -516,6 +546,14 @@ class MySQLCache:
             with conn.cursor() as cur:
                 cur.execute(
                     """
+                    UPDATE `place_geocode_cache`
+                    SET hit_count = hit_count + 1
+                    WHERE source = %s AND query_key = %s
+                    """,
+                    (source, query_key),
+                )
+                cur.execute(
+                    """
                     SELECT place_id, name, address, subtitle,
                            latitude, longitude, country, country_code, locality, place_type, category
                     FROM `place_geocode_cache`
@@ -558,6 +596,14 @@ class MySQLCache:
 
         with self._connect() as conn:
             with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE `place_geocode_cache`
+                    SET hit_count = hit_count + 1
+                    WHERE source = %s AND query_key IN ({placeholders})
+                    """,
+                    (source, *query_keys),
+                )
                 cur.execute(
                     f"""
                     SELECT query_key, place_id, name, address, subtitle,
@@ -682,6 +728,114 @@ class MySQLCache:
                       AND query_key = %s
                     """,
                     (source, query_key),
+                )
+
+    def get_ai_job(self, task_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT task_id, cache_key, provider, language, status, progress, message, error_message, request_payload, created_at, updated_at
+                    FROM `ai_parse_jobs`
+                    WHERE task_id = %s
+                    LIMIT 1
+                    """,
+                    (task_id,),
+                )
+                return cur.fetchone()
+
+    def get_active_ai_job_by_cache_key(self, cache_key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT task_id, cache_key, provider, language, status, progress, message, error_message, request_payload, created_at, updated_at
+                    FROM `ai_parse_jobs`
+                    WHERE cache_key = %s
+                      AND status IN ('queued', 'processing')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (cache_key,),
+                )
+                return cur.fetchone()
+
+    def set_ai_job(
+        self,
+        task_id: str,
+        cache_key: str,
+        provider: str,
+        language: str,
+        request_payload: dict[str, Any],
+        status: str = "queued",
+        progress: int = 0,
+        message: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO `ai_parse_jobs`
+                    (task_id, cache_key, provider, language, status, progress, message, request_payload)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        cache_key = VALUES(cache_key),
+                        provider = VALUES(provider),
+                        language = VALUES(language),
+                        status = VALUES(status),
+                        progress = VALUES(progress),
+                        message = VALUES(message),
+                        request_payload = VALUES(request_payload),
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        task_id,
+                        cache_key,
+                        provider,
+                        (language or "zh-CN")[:32],
+                        status,
+                        max(0, min(100, int(progress))),
+                        message[:255],
+                        json.dumps(request_payload, ensure_ascii=False),
+                    ),
+                )
+
+    def update_ai_job_progress(
+        self,
+        task_id: str,
+        *,
+        status: str | None = None,
+        progress: int | None = None,
+        message: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        fields: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            fields.append("status = %s")
+            params.append(status)
+        if progress is not None:
+            fields.append("progress = %s")
+            params.append(max(0, min(100, int(progress))))
+        if message is not None:
+            fields.append("message = %s")
+            params.append(message[:255])
+        if error_message is not None:
+            fields.append("error_message = %s")
+            params.append(error_message)
+        if not fields:
+            return
+        fields.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(task_id)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    UPDATE `ai_parse_jobs`
+                    SET {", ".join(fields)}
+                    WHERE task_id = %s
+                    """,
+                    tuple(params),
                 )
 
     def _geocode_query_key(self, source: str, query: str, language: str, country_filter_code: str | None) -> str:

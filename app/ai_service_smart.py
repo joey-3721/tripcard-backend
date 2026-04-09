@@ -77,6 +77,7 @@ async def parse_itinerary_smart(
     destination: str | None,
     language: str,
     model_name: str = "deepseek",
+    progress_callback=None,
 ) -> ParseItinerarySmartResponse:
     started_at = time.perf_counter()
     provider = normalize_ai_provider(model_name)
@@ -105,14 +106,17 @@ async def parse_itinerary_smart(
         destination or "",
         language,
     )
+    await emit_progress(progress_callback, 5, "开始 AI 解析")
     token_info = get_ai_token(provider)
     ai_output, preparse_warnings, segmented = await resolve_ai_output_smart(
         text=text,
         destination=destination,
         provider=provider,
         token_info=token_info,
+        progress_callback=progress_callback,
     )
     ai_elapsed = time.perf_counter() - started_at
+    await emit_progress(progress_callback, 55, "AI 解析完成，开始地点识别")
 
     resolved_destination = ai_output.get("destination", destination or "")
     resolved_region = ai_output.get("region", resolved_destination)
@@ -195,6 +199,8 @@ async def parse_itinerary_smart(
         destination=destination,
         language=language,
         preserve_unresolved=True,
+        progress_callback=progress_callback,
+        progress_range=(55, 98),
     )
     should_filter_empty_locations = resolved_country_code.upper() != "CN"
     filtered_day_plans: list[DayPlanResponseSmart] = []
@@ -239,6 +245,16 @@ async def parse_itinerary_smart(
     if should_filter_empty_locations and dropped_day_count:
         warnings.append(f"Filtered {dropped_day_count} empty day plans after coordinate cleanup.")
     warnings = dedupe_warnings(warnings)
+    if should_filter_empty_locations and not filtered_day_plans and no_geocoding_response.dayPlans:
+        logger.warning(
+            "parse-itinerary-smart no geocoded activities survived provider=%s destination=%s total_days=%s dropped_activities=%s dropped_days=%s",
+            provider,
+            resolved_destination,
+            response.totalDays,
+            dropped_activity_count,
+            dropped_day_count,
+        )
+        raise RuntimeError("未识别到可用地点，请稍后重试、缩短文案，或切换模型。")
     total_elapsed = time.perf_counter() - started_at
     smart_response = ParseItinerarySmartResponse(
         destination=response.destination,
@@ -252,6 +268,7 @@ async def parse_itinerary_smart(
         cache_key,
         json.loads(smart_response.model_dump_json()),
     )
+    await emit_progress(progress_callback, 100, "解析完成")
     logger.info(
         "parse-itinerary-smart response provider=%s segmented=%s geocoding_mode=%s ai_elapsed=%.3fs total_elapsed=%.3fs dropped_activities=%s dropped_days=%s payload=%s",
         provider,
@@ -292,6 +309,7 @@ async def resolve_ai_output_smart(
     destination: str | None,
     provider: str,
     token_info: dict,
+    progress_callback=None,
 ) -> tuple[dict, list[str], bool]:
     if not should_use_segmented_parsing(text, provider):
         logger.info(
@@ -299,6 +317,7 @@ async def resolve_ai_output_smart(
             provider,
             len(text),
         )
+        await emit_progress(progress_callback, 15, "单次 AI 解析中")
         return await call_ai_model(text, destination, token_info, provider), [], False
 
     segmentation_started_at = time.perf_counter()
@@ -322,6 +341,7 @@ async def resolve_ai_output_smart(
         len(segments),
         segmentation_output.get("totalDays", 0),
     )
+    await emit_progress(progress_callback, 15, f"已拆分为 {len(segments)} 段")
     if len(segments) <= 1:
         ai_output = await call_ai_model(text, destination, token_info, provider)
         warnings = segmentation_warnings
@@ -334,6 +354,7 @@ async def resolve_ai_output_smart(
         destination=destination,
         provider=provider,
         token_info=token_info,
+        progress_callback=progress_callback,
     )
     if not parsed_segments:
         logger.warning("parse-itinerary-smart all segments failed; falling back to single-shot parsing provider=%s", provider)
@@ -433,9 +454,11 @@ async def parse_segments_concurrently(
     destination: str | None,
     provider: str,
     token_info: dict,
+    progress_callback=None,
 ) -> tuple[list[dict], list[str]]:
     semaphore = asyncio.Semaphore(SEGMENT_PARSE_CONCURRENCY)
     warnings: list[str] = []
+    completed_segments = 0
 
     async def run_segment(segment: dict) -> tuple[dict | None, list[str]]:
         async with semaphore:
@@ -446,13 +469,19 @@ async def parse_segments_concurrently(
                 token_info=token_info,
             )
 
-    results = await asyncio.gather(*(run_segment(segment) for segment in segments))
-
     parsed_segments: list[dict] = []
-    for result, segment_warnings in results:
+    if not segments:
+        return parsed_segments, warnings
+
+    tasks = [asyncio.create_task(run_segment(segment)) for segment in segments]
+    for finished_task in asyncio.as_completed(tasks):
+        result, segment_warnings = await finished_task
+        completed_segments += 1
         warnings.extend(segment_warnings)
         if result is not None:
             parsed_segments.append(result)
+        progress = 15 + int((completed_segments / len(segments)) * 35)
+        await emit_progress(progress_callback, progress, f"AI 分段解析 {completed_segments}/{len(segments)}")
 
     parsed_segments.sort(key=lambda item: item["segmentNumber"])
     return parsed_segments, warnings
@@ -637,3 +666,9 @@ def dedupe_warnings(warnings: list[str]) -> list[str]:
         seen.add(normalized)
         deduped.append(normalized)
     return deduped
+
+
+async def emit_progress(progress_callback, progress: int, message: str) -> None:
+    if progress_callback is None:
+        return
+    await progress_callback(max(0, min(100, int(progress))), message)

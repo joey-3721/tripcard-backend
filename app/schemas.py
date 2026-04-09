@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 SearchScope = Literal["all", "domestic", "international"]
 SearchCategory = Literal["hotel", "attraction", "restaurant", "shopping", "transport", "other"]
 ItineraryGeocodingMode = Literal["client_apple", "backend_geoapify"]
+AIParseJobStatusType = Literal["queued", "processing", "completed", "failed"]
 
 
 class DestinationSeed(BaseModel):
@@ -201,3 +202,21 @@ class ParseItinerarySmartResponse(BaseModel):
     dayPlans: list[DayPlanResponseSmart]
     warnings: list[str] = Field(default_factory=list)
     geocodingMode: ItineraryGeocodingMode
+
+
+class ParseItineraryAsyncStartResponse(BaseModel):
+    taskId: str | None = None
+    status: AIParseJobStatusType
+    progress: int = 0
+    message: str = ""
+    cacheHit: bool = False
+    result: ParseItinerarySmartResponse | None = None
+
+
+class ParseItineraryAsyncStatusResponse(BaseModel):
+    taskId: str
+    status: AIParseJobStatusType
+    progress: int = 0
+    message: str = ""
+    result: ParseItinerarySmartResponse | None = None
+    error: str | None = None
