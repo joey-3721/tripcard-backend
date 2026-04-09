@@ -123,11 +123,15 @@ async def _search_google_places_api(
         return []
     if not usage.get("allowed", False):
         logger.warning(
-            "google monthly limit reached query=%s usage=%s/%s month=%s",
+            "google limit reached query=%s monthly=%s/%s month=%s daily=%s/%s date=%s reason=%s",
             query,
             usage.get("monthly_call_count", 0),
-            usage.get("monthly_limit", 0),
+            usage.get("monthly_limit", -1),
             usage.get("usage_month", ""),
+            usage.get("daily_call_count", 0),
+            usage.get("daily_limit", -1),
+            usage.get("usage_date", ""),
+            usage.get("reason", ""),
         )
         return []
 
@@ -186,12 +190,15 @@ async def _search_google_places_api(
         )
 
     logger.info(
-        "google places api call query=%s results=%d usage=%s/%s month=%s",
+        "google places api call query=%s results=%d monthly=%s/%s month=%s daily=%s/%s date=%s",
         query,
         len(items),
         usage.get("monthly_call_count", 0),
-        usage.get("monthly_limit", 0),
+        usage.get("monthly_limit", -1),
         usage.get("usage_month", ""),
+        usage.get("daily_call_count", 0),
+        usage.get("daily_limit", -1),
+        usage.get("usage_date", ""),
     )
     return items
 

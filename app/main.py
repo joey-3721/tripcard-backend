@@ -846,7 +846,7 @@ async def parse_itinerary_smart_endpoint(request: ParseItineraryRequest) -> Pars
     from app.ai_service_smart import parse_itinerary_smart
 
     try:
-        return await parse_itinerary_smart(request.text, request.destination, request.language, request.modelName)
+        return await parse_itinerary_smart(request.text, None, request.language, request.modelName)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except httpx.TimeoutException:
@@ -874,7 +874,7 @@ async def parse_itinerary_smart_async_start_endpoint(request: ParseItineraryRequ
     provider = normalize_ai_provider(request.modelName)
     cache_key = build_smart_parse_cache_key(
         text=request.text,
-        destination=request.destination,
+        destination=None,
         language=request.language,
         provider=provider,
     )
@@ -919,7 +919,7 @@ async def parse_itinerary_smart_async_start_endpoint(request: ParseItineraryRequ
 
             result = await parse_itinerary_smart(
                 request.text,
-                request.destination,
+                None,
                 request.language,
                 request.modelName,
                 progress_callback=progress_callback,

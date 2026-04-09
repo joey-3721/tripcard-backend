@@ -106,6 +106,21 @@ async def _search_geoapify_api(
     country_filter_code: str | None,
     limit: int,
 ) -> list[ProviderPlace]:
+    usage = db.increment_ai_provider_usage("geoapify")
+    if usage is None:
+        logger.warning("geoapify usage row missing when querying=%s", query)
+        return []
+    if not usage.get("allowed", False):
+        logger.warning(
+            "geoapify daily limit reached query=%s usage=%s/%s date=%s reason=%s",
+            query,
+            usage.get("daily_call_count", 0),
+            usage.get("daily_limit", -1),
+            usage.get("usage_date", ""),
+            usage.get("reason", ""),
+        )
+        return []
+
     params = {
         "text": query,
         "apiKey": token_row["token"],
@@ -168,7 +183,14 @@ async def _search_geoapify_api(
                 country_filter_code=country_filter_code,
                 rows=cache_rows,
             )
-        logger.info("geoapify api call query=%s results=%d cached", query, len(rows))
+        logger.info(
+            "geoapify api call query=%s results=%d usage=%s/%s date=%s cached",
+            query,
+            len(rows),
+            usage.get("daily_call_count", 0),
+            usage.get("daily_limit", -1),
+            usage.get("usage_date", ""),
+        )
 
     items: list[ProviderPlace] = []
     for row in rows:

@@ -69,7 +69,7 @@ SEGMENTATION_EXPLICIT_DAY_THRESHOLD = 3
 SEGMENT_PARSE_CONCURRENCY = 6
 SEGMENT_PARSE_RETRIES = 2
 SEGMENT_MAX_EXPECTED_DAYS = 2
-SMART_PARSE_CACHE_VERSION = 1
+SMART_PARSE_CACHE_VERSION = 2
 
 
 async def parse_itinerary_smart(
@@ -81,9 +81,12 @@ async def parse_itinerary_smart(
 ) -> ParseItinerarySmartResponse:
     started_at = time.perf_counter()
     provider = normalize_ai_provider(model_name)
+    # Do not trust client-side trip/card destination context for smart parsing.
+    # The AI should infer destination only from the itinerary text itself.
+    effective_destination: str | None = None
     cache_key = build_smart_parse_cache_key(
         text=text,
-        destination=destination,
+        destination=effective_destination,
         language=language,
         provider=provider,
     )
@@ -94,7 +97,7 @@ async def parse_itinerary_smart(
         logger.info(
             "parse-itinerary-smart cache hit provider=%s destination=%s language=%s elapsed=%.3fs",
             provider,
-            destination or "",
+            effective_destination or "",
             language,
             time.perf_counter() - started_at,
         )
@@ -103,14 +106,14 @@ async def parse_itinerary_smart(
     logger.info(
         "parse-itinerary-smart cache miss provider=%s destination=%s language=%s",
         provider,
-        destination or "",
+        effective_destination or "",
         language,
     )
     await emit_progress(progress_callback, 5, "开始 AI 解析")
     token_info = get_ai_token(provider)
     ai_output, preparse_warnings, segmented = await resolve_ai_output_smart(
         text=text,
-        destination=destination,
+        destination=effective_destination,
         provider=provider,
         token_info=token_info,
         progress_callback=progress_callback,
@@ -118,7 +121,7 @@ async def parse_itinerary_smart(
     ai_elapsed = time.perf_counter() - started_at
     await emit_progress(progress_callback, 55, "AI 解析完成，开始地点识别")
 
-    resolved_destination = ai_output.get("destination", destination or "")
+    resolved_destination = ai_output.get("destination", effective_destination or "")
     resolved_region = ai_output.get("region", resolved_destination)
     resolved_country = ai_output.get("country", "")
     resolved_country_code = normalize_country_code(ai_output.get("countryCode", ""))
@@ -145,7 +148,7 @@ async def parse_itinerary_smart(
             ai_output["countryCode"] = resolved_country_code
 
     if resolved_country_code.upper() == "CN":
-        response = build_parse_itinerary_no_geocoding_response(ai_output=ai_output, destination=destination)
+        response = build_parse_itinerary_no_geocoding_response(ai_output=ai_output, destination=effective_destination)
         warnings = dedupe_warnings(preparse_warnings + response.warnings)
         total_elapsed = time.perf_counter() - started_at
         smart_response = ParseItinerarySmartResponse(
@@ -193,10 +196,10 @@ async def parse_itinerary_smart(
         )
         return smart_response
 
-    no_geocoding_response = build_parse_itinerary_no_geocoding_response(ai_output=ai_output, destination=destination)
+    no_geocoding_response = build_parse_itinerary_no_geocoding_response(ai_output=ai_output, destination=effective_destination)
     response = await parse_itinerary_from_ai_output(
         ai_output=ai_output,
-        destination=destination,
+        destination=effective_destination,
         language=language,
         preserve_unresolved=True,
         progress_callback=progress_callback,
@@ -577,6 +580,10 @@ def merge_segment_outputs(
                 continue
             merged_day = dict(day)
             merged_day["dayNumber"] = next_day_number
+            merged_day["_segmentDestination"] = str(segment["aiOutput"].get("destination") or "").strip()
+            merged_day["_segmentRegion"] = str(segment["aiOutput"].get("region") or "").strip()
+            merged_day["_segmentCountry"] = str(segment["aiOutput"].get("country") or "").strip()
+            merged_day["_segmentCountryCode"] = normalize_country_code(segment["aiOutput"].get("countryCode") or "")
             merged_day_plans.append(merged_day)
             next_day_number += 1
 

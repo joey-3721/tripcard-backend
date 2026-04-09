@@ -55,6 +55,9 @@ BOARDING_PLACE_TYPE_HINTS = {
     "quay",
     "jetty",
     "landing",
+    "station",
+    "railway_station",
+    "train_station",
 }
 BOARDING_TEXT_HINTS = BOARDING_PLACE_TYPE_HINTS | {
     "boarding",
@@ -62,6 +65,8 @@ BOARDING_TEXT_HINTS = BOARDING_PLACE_TYPE_HINTS | {
     "embarcadero",
     "cruise",
     "boat",
+    "railway",
+    "train station",
 }
 STRICT_IDENTITY_KEYWORDS = (
     "university",
@@ -163,6 +168,86 @@ ATTRACTION_RESULT_REJECT_TOKENS = (
 )
 
 CANONICAL_ACTIVITY_RULES: dict[str, dict] = {
+    "reembay民宿": {
+        "title": "Reem Bay",
+        "search_name": "Reem Bay Marsa Matruh Egypt",
+        "acceptable": ("reem bay",),
+        "category": "hotel",
+    },
+    "noureiwahahotel民宿": {
+        "title": "Nour El Waha Hotel",
+        "search_name": "Nour El Waha Hotel Siwa Egypt",
+        "acceptable": ("nour el waha hotel", "nour ei waha hotel"),
+        "category": "hotel",
+    },
+    "沙利古堡": {
+        "title": "Shali Fortress",
+        "search_name": "Shali Fortress Siwa Egypt",
+        "acceptable": ("shali fortress", "shali castle"),
+    },
+    "盐湖": {
+        "title": "Siwa Salt Lake",
+        "search_name": "Siwa Salt Lake Siwa Egypt",
+        "acceptable": ("siwa salt lake", "salt lake siwa"),
+    },
+    "艳后温泉": {
+        "title": "Cleopatra Spring",
+        "search_name": "Cleopatra Spring Siwa Egypt",
+        "acceptable": ("cleopatra spring", "cleopatra bath"),
+    },
+    "亡灵山": {
+        "title": "Gebel al-Mawta",
+        "search_name": "Gebel al-Mawta Siwa Egypt",
+        "acceptable": ("gebel almawta", "mount of the dead"),
+    },
+    "锡瓦湖": {
+        "title": "Siwa Lake",
+        "search_name": "Siwa Lake Siwa Egypt",
+        "acceptable": ("siwa lake",),
+    },
+    "垃圾城": {
+        "title": "Manshiyat Naser",
+        "search_name": "Manshiyat Naser Cairo Egypt",
+        "acceptable": ("manshiyat naser", "garbage city"),
+    },
+    "洞穴教堂": {
+        "title": "Saint Simon Monastery",
+        "search_name": "Saint Simon Monastery Cairo Egypt",
+        "acceptable": ("saint simon monastery", "cave church"),
+    },
+    "哈利利市场": {
+        "title": "Khan el-Khalili",
+        "search_name": "Khan el-Khalili Cairo Egypt",
+        "acceptable": ("khan elkhalili", "khan el khalili"),
+        "category": "shopping",
+    },
+    "吉萨金字塔群": {
+        "title": "Pyramids of Giza",
+        "search_name": "Pyramids of Giza Giza Egypt",
+        "acceptable": ("pyramids of giza", "giza pyramid complex"),
+    },
+    "哈布城": {
+        "title": "Medinet Habu",
+        "search_name": "Medinet Habu Luxor Egypt",
+        "acceptable": ("medinet habu", "habu temple"),
+    },
+    "尼罗河施柏阁酒店": {
+        "title": "Steigenberger Nile Palace",
+        "search_name": "Steigenberger Nile Palace Luxor Egypt",
+        "acceptable": ("steigenberger nile palace",),
+        "category": "hotel",
+    },
+    "胡戈哈达广场希尔顿酒店": {
+        "title": "Hilton Hurghada Plaza",
+        "search_name": "Hilton Hurghada Plaza Hurghada Egypt",
+        "acceptable": ("hilton hurghada plaza",),
+        "category": "hotel",
+    },
+    "橘子岛": {
+        "title": "Orange Bay",
+        "search_name": "Orange Bay Hurghada Egypt",
+        "acceptable": ("orange bay", "orange island"),
+    },
     "国博": {
         "title": "中国国家博物馆",
         "search_name": "National Museum of China Beijing China",
@@ -334,13 +419,16 @@ def get_ai_token(provider: str = "deepseek") -> dict:
     if row is None:
         raise RuntimeError(f"No enabled AI token found for provider={provider}")
     logger.info(
-        "ai token resolved provider=%s configured_model=%s base_url=%s monthly_call_count=%s monthly_limit=%s usage_month=%s",
+        "ai token resolved provider=%s configured_model=%s base_url=%s monthly_call_count=%s monthly_limit=%s usage_month=%s daily_call_count=%s daily_limit=%s usage_date=%s",
         provider,
         row.get("model", ""),
         row.get("base_url", ""),
         row.get("monthly_call_count", 0),
-        row.get("monthly_limit", 0),
+        row.get("monthly_limit", -1),
         row.get("usage_month", ""),
+        row.get("daily_call_count", 0),
+        row.get("daily_limit", -1),
+        row.get("usage_date", ""),
     )
     return row
 
@@ -835,6 +923,10 @@ async def parse_itinerary_from_ai_output(
     task_indices = []  # (day_idx, activity_idx)
 
     for day_idx, day in enumerate(day_plans_raw):
+        day_destination = str(day.get("_segmentDestination") or resolved_destination or "").strip()
+        day_region = str(day.get("_segmentRegion") or day_destination or resolved_region or "").strip()
+        day_country = str(day.get("_segmentCountry") or resolved_country or "").strip()
+        day_country_code = normalize_country_code(day.get("_segmentCountryCode") or resolved_country_code)
         for act_idx, act in enumerate(day.get("activities", [])):
             search_name = act.get("searchName") or act.get("title", "")
             category = act.get("category", "other")
@@ -849,6 +941,10 @@ async def parse_itinerary_from_ai_output(
                         normalized_location_mode(act),
                         str(act.get("placeHint") or "").strip(),
                         str(act.get("boardingPointHint") or "").strip(),
+                        day_destination,
+                        day_region,
+                        day_country,
+                        day_country_code,
                     )
                 )
                 task_indices.append((day_idx, act_idx))
@@ -886,13 +982,13 @@ async def parse_itinerary_from_ai_output(
         if resolved_country_code != "CN":
             all_geoapify_queries: list[str] = []
             seen_geoapify_queries: set[str] = set()
-            for name, title, _original_mention, _cat, activity_type, location_mode, place_hint, boarding_point_hint in geocode_tasks:
+            for name, title, _original_mention, _cat, activity_type, location_mode, place_hint, boarding_point_hint, task_destination, _task_region, task_country, task_country_code in geocode_tasks:
                 queries = geocode_query_candidates(
                     name,
                     title,
-                    resolved_destination,
-                    resolved_country,
-                    resolved_country_code,
+                    task_destination,
+                    task_country,
+                    task_country_code,
                     activity_type=activity_type,
                     location_mode=location_mode,
                     place_hint=place_hint,
@@ -922,6 +1018,10 @@ async def parse_itinerary_from_ai_output(
             location_mode: str,
             place_hint: str,
             boarding_point_hint: str,
+            task_destination: str,
+            task_region: str,
+            task_country: str,
+            task_country_code: str,
         ) -> tuple[int, TripLocationResponse | None | Exception]:
             try:
                 location = await geocode_single_place(
@@ -932,10 +1032,10 @@ async def parse_itinerary_from_ai_output(
                     location_mode=location_mode,
                     place_hint=place_hint,
                     boarding_point_hint=boarding_point_hint,
-                    destination=resolved_destination,
-                    region=resolved_region,
-                    country=resolved_country,
-                    country_code=resolved_country_code,
+                    destination=task_destination,
+                    region=task_region,
+                    country=task_country,
+                    country_code=task_country_code,
                     category=cat,
                     language=language,
                     semaphore=semaphore,
@@ -957,9 +1057,13 @@ async def parse_itinerary_from_ai_output(
                     location_mode=location_mode,
                     place_hint=place_hint,
                     boarding_point_hint=boarding_point_hint,
+                    task_destination=task_destination,
+                    task_region=task_region,
+                    task_country=task_country,
+                    task_country_code=task_country_code,
                 )
             )
-            for index, (name, title, original_mention, cat, activity_type, location_mode, place_hint, boarding_point_hint) in enumerate(geocode_tasks)
+            for index, (name, title, original_mention, cat, activity_type, location_mode, place_hint, boarding_point_hint, task_destination, task_region, task_country, task_country_code) in enumerate(geocode_tasks)
         ]
         locations: list[TripLocationResponse | None | Exception] = [None] * len(tasks)
         total_locations = len(tasks)
@@ -1179,6 +1283,8 @@ def normalize_activity_dict(activity: dict) -> list[dict]:
     normalized["title"] = rule["title"]
     normalized["canonicalTitle"] = rule["title"]
     normalized["searchName"] = rule["search_name"]
+    if rule.get("category"):
+        normalized["category"] = rule["category"]
     normalized["activityType"] = normalized_activity_type(normalized)
     normalized["locationMode"] = normalized_location_mode(normalized)
     normalized["placeHint"] = str(normalized.get("placeHint") or "").strip()
@@ -1660,7 +1766,9 @@ def is_reasonably_confident_result(item, category: str) -> bool:
 
 
 def is_context_consistent_result(item, category: str) -> bool:
-    if category not in {"restaurant", "hotel", "shopping"}:
+    if category == "hotel":
+        return True
+    if category not in {"restaurant", "shopping"}:
         return True
     matched_by = set(getattr(item, "matched_by", []) or [])
     if "destination_context_match" in matched_by:

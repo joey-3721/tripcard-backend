@@ -24,6 +24,7 @@ class MySQLCache:
             charset="utf8mb4",
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=True,
+            init_command="SET time_zone = '+08:00'",
         )
 
     def ensure_table(self) -> None:
@@ -85,6 +86,7 @@ class MySQLCache:
 
     def ensure_ai_tokens_table(self) -> None:
         current_month = self._current_usage_month()
+        current_date = self._current_usage_date()
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -96,8 +98,11 @@ class MySQLCache:
                         model       VARCHAR(64)  NOT NULL DEFAULT 'deepseek-chat',
                         base_url    VARCHAR(256) NOT NULL DEFAULT 'https://api.deepseek.com',
                         monthly_call_count INT NOT NULL DEFAULT 0,
-                        monthly_limit      INT NOT NULL DEFAULT 0,
+                        monthly_limit      INT NOT NULL DEFAULT -1,
                         usage_month        VARCHAR(7) NOT NULL DEFAULT '',
+                        daily_call_count   INT NOT NULL DEFAULT 0,
+                        daily_limit        INT NOT NULL DEFAULT -1,
+                        usage_date         VARCHAR(10) NOT NULL DEFAULT '',
                         enabled     TINYINT(1)   NOT NULL DEFAULT 1,
                         created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         updated_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -115,13 +120,31 @@ class MySQLCache:
                     cur=cur,
                     table_name=settings.ai_tokens_table_name,
                     column_name="monthly_limit",
-                    definition="INT NOT NULL DEFAULT 0",
+                    definition="INT NOT NULL DEFAULT -1",
                 )
                 self._ensure_column_exists(
                     cur=cur,
                     table_name=settings.ai_tokens_table_name,
                     column_name="usage_month",
                     definition="VARCHAR(7) NOT NULL DEFAULT ''",
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name=settings.ai_tokens_table_name,
+                    column_name="daily_call_count",
+                    definition="INT NOT NULL DEFAULT 0",
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name=settings.ai_tokens_table_name,
+                    column_name="daily_limit",
+                    definition="INT NOT NULL DEFAULT -1",
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name=settings.ai_tokens_table_name,
+                    column_name="usage_date",
+                    definition="VARCHAR(10) NOT NULL DEFAULT ''",
                 )
                 cur.execute(
                     f"""
@@ -134,8 +157,37 @@ class MySQLCache:
                 cur.execute(
                     f"""
                     UPDATE `{settings.ai_tokens_table_name}`
+                    SET usage_date = %s
+                    WHERE usage_date = ''
+                    """,
+                    (current_date,),
+                )
+                cur.execute(
+                    f"""
+                    UPDATE `{settings.ai_tokens_table_name}`
                     SET monthly_limit = 3000
                     WHERE provider = 'google' AND monthly_limit = 0
+                    """,
+                )
+                cur.execute(
+                    f"""
+                    UPDATE `{settings.ai_tokens_table_name}`
+                    SET daily_limit = 3000
+                    WHERE provider = 'geoapify' AND daily_limit = 0
+                    """,
+                )
+                cur.execute(
+                    f"""
+                    UPDATE `{settings.ai_tokens_table_name}`
+                    SET monthly_limit = -1
+                    WHERE monthly_limit = 0
+                    """,
+                )
+                cur.execute(
+                    f"""
+                    UPDATE `{settings.ai_tokens_table_name}`
+                    SET daily_limit = -1
+                    WHERE daily_limit = 0
                     """,
                 )
 
@@ -144,7 +196,7 @@ class MySQLCache:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT token, model, base_url, monthly_call_count, monthly_limit, usage_month FROM `{settings.ai_tokens_table_name}` "
+                    f"SELECT token, model, base_url, monthly_call_count, monthly_limit, usage_month, daily_call_count, daily_limit, usage_date FROM `{settings.ai_tokens_table_name}` "
                     "WHERE provider = %s AND enabled = 1 LIMIT 1",
                     (provider,),
                 )
@@ -152,6 +204,7 @@ class MySQLCache:
 
     def reset_ai_provider_usage_if_needed(self, provider: str) -> None:
         current_month = self._current_usage_month()
+        current_date = self._current_usage_date()
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -165,9 +218,21 @@ class MySQLCache:
                     """,
                     (current_month, provider, current_month),
                 )
+                cur.execute(
+                    f"""
+                    UPDATE `{settings.ai_tokens_table_name}`
+                    SET daily_call_count = 0,
+                        usage_date = %s
+                    WHERE provider = %s
+                      AND enabled = 1
+                      AND usage_date <> %s
+                    """,
+                    (current_date, provider, current_date),
+                )
 
     def increment_ai_provider_usage(self, provider: str, amount: int = 1) -> dict | None:
         current_month = self._current_usage_month()
+        current_date = self._current_usage_date()
         amount = max(1, int(amount))
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -186,7 +251,21 @@ class MySQLCache:
                 )
                 cur.execute(
                     f"""
-                    SELECT id, monthly_call_count, monthly_limit, usage_month
+                    UPDATE `{settings.ai_tokens_table_name}`
+                    SET daily_call_count = CASE
+                            WHEN usage_date = %s THEN daily_call_count
+                            ELSE 0
+                        END,
+                        usage_date = %s
+                    WHERE provider = %s
+                      AND enabled = 1
+                    """,
+                    (current_date, current_date, provider),
+                )
+                cur.execute(
+                    f"""
+                    SELECT id, monthly_call_count, monthly_limit, usage_month,
+                           daily_call_count, daily_limit, usage_date
                     FROM `{settings.ai_tokens_table_name}`
                     WHERE provider = %s
                       AND enabled = 1
@@ -198,30 +277,76 @@ class MySQLCache:
                 if row is None:
                     return None
 
-                monthly_limit = int(row.get("monthly_limit") or 0)
+                monthly_limit = int(row.get("monthly_limit") if row.get("monthly_limit") is not None else -1)
                 monthly_call_count = int(row.get("monthly_call_count") or 0)
+                daily_limit = int(row.get("daily_limit") if row.get("daily_limit") is not None else -1)
+                daily_call_count = int(row.get("daily_call_count") or 0)
+                if monthly_limit == 0:
+                    return {
+                        "provider": provider,
+                        "monthly_call_count": monthly_call_count,
+                        "monthly_limit": monthly_limit,
+                        "usage_month": row.get("usage_month") or current_month,
+                        "daily_call_count": daily_call_count,
+                        "daily_limit": daily_limit,
+                        "usage_date": row.get("usage_date") or current_date,
+                        "allowed": False,
+                        "reason": "monthly_disabled",
+                    }
+                if daily_limit == 0:
+                    return {
+                        "provider": provider,
+                        "monthly_call_count": monthly_call_count,
+                        "monthly_limit": monthly_limit,
+                        "usage_month": row.get("usage_month") or current_month,
+                        "daily_call_count": daily_call_count,
+                        "daily_limit": daily_limit,
+                        "usage_date": row.get("usage_date") or current_date,
+                        "allowed": False,
+                        "reason": "daily_disabled",
+                    }
                 if monthly_limit > 0 and monthly_call_count + amount > monthly_limit:
                     return {
                         "provider": provider,
                         "monthly_call_count": monthly_call_count,
                         "monthly_limit": monthly_limit,
                         "usage_month": row.get("usage_month") or current_month,
+                        "daily_call_count": daily_call_count,
+                        "daily_limit": daily_limit,
+                        "usage_date": row.get("usage_date") or current_date,
                         "allowed": False,
+                        "reason": "monthly_limit_reached",
+                    }
+                if daily_limit > 0 and daily_call_count + amount > daily_limit:
+                    return {
+                        "provider": provider,
+                        "monthly_call_count": monthly_call_count,
+                        "monthly_limit": monthly_limit,
+                        "usage_month": row.get("usage_month") or current_month,
+                        "daily_call_count": daily_call_count,
+                        "daily_limit": daily_limit,
+                        "usage_date": row.get("usage_date") or current_date,
+                        "allowed": False,
+                        "reason": "daily_limit_reached",
                     }
 
                 cur.execute(
                     f"""
                     UPDATE `{settings.ai_tokens_table_name}`
-                    SET monthly_call_count = monthly_call_count + %s
+                    SET monthly_call_count = monthly_call_count + %s,
+                        daily_call_count = daily_call_count + %s
                     WHERE id = %s
                     """,
-                    (amount, row["id"]),
+                    (amount, amount, row["id"]),
                 )
                 return {
                     "provider": provider,
                     "monthly_call_count": monthly_call_count + amount,
                     "monthly_limit": monthly_limit,
                     "usage_month": row.get("usage_month") or current_month,
+                    "daily_call_count": daily_call_count + amount,
+                    "daily_limit": daily_limit,
+                    "usage_date": row.get("usage_date") or current_date,
                     "allowed": True,
                 }
 
@@ -230,22 +355,21 @@ class MySQLCache:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT payload FROM `ai_parse_cache` "
-                    "WHERE cache_key = %s AND expires_at > NOW() LIMIT 1",
+                    "WHERE cache_key = %s LIMIT 1",
                     (cache_key,),
                 )
                 row = cur.fetchone()
                 return json.loads(row["payload"]) if row else None
 
     def set_ai_cache(self, cache_key: str, payload: dict, ttl_seconds: int = 86400 * 7) -> None:
-        expires_at = int(time.time()) + ttl_seconds
         encoded = json.dumps(payload, ensure_ascii=False)
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO `ai_parse_cache` (cache_key, payload, expires_at) "
-                    "VALUES (%s, %s, FROM_UNIXTIME(%s)) "
-                    "ON DUPLICATE KEY UPDATE payload=VALUES(payload), expires_at=VALUES(expires_at), created_at=CURRENT_TIMESTAMP",
-                    (cache_key, encoded, expires_at),
+                    "INSERT INTO `ai_parse_cache` (cache_key, payload) "
+                    "VALUES (%s, %s) "
+                    "ON DUPLICATE KEY UPDATE payload=VALUES(payload), created_at=CURRENT_TIMESTAMP",
+                    (cache_key, encoded),
                 )
 
     def ensure_ai_parse_cache_table(self) -> None:
@@ -256,11 +380,25 @@ class MySQLCache:
                     CREATE TABLE IF NOT EXISTS `ai_parse_cache` (
                         cache_key VARCHAR(64) PRIMARY KEY,
                         payload   LONGTEXT NOT NULL,
-                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        expires_at DATETIME NOT NULL,
-                        INDEX idx_expires_at (expires_at)
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
                     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
                     """
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name="ai_parse_cache",
+                    column_name="created_at",
+                    definition="DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
+                )
+                self._drop_index_if_exists(
+                    cur=cur,
+                    table_name="ai_parse_cache",
+                    index_name="idx_expires_at",
+                )
+                self._drop_column_if_exists(
+                    cur=cur,
+                    table_name="ai_parse_cache",
+                    column_name="expires_at",
                 )
 
     def ensure_ai_parse_jobs_table(self) -> None:
@@ -861,6 +999,9 @@ class MySQLCache:
     def _current_usage_month(self) -> str:
         return time.strftime("%Y-%m")
 
+    def _current_usage_date(self) -> str:
+        return time.strftime("%Y-%m-%d")
+
     def _ensure_column_exists(self, cur, table_name: str, column_name: str, definition: str) -> None:
         cur.execute(
             """
@@ -880,5 +1021,49 @@ class MySQLCache:
             f"""
             ALTER TABLE `{table_name}`
             ADD COLUMN `{column_name}` {definition}
+            """
+        )
+
+    def _drop_column_if_exists(self, cur, table_name: str, column_name: str) -> None:
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = %s
+              AND COLUMN_NAME = %s
+            LIMIT 1
+            """,
+            (settings.mysql_db, table_name, column_name),
+        )
+        if not cur.fetchone():
+            return
+
+        cur.execute(
+            f"""
+            ALTER TABLE `{table_name}`
+            DROP COLUMN `{column_name}`
+            """
+        )
+
+    def _drop_index_if_exists(self, cur, table_name: str, index_name: str) -> None:
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = %s
+              AND INDEX_NAME = %s
+            LIMIT 1
+            """,
+            (settings.mysql_db, table_name, index_name),
+        )
+        if not cur.fetchone():
+            return
+
+        cur.execute(
+            f"""
+            ALTER TABLE `{table_name}`
+            DROP INDEX `{index_name}`
             """
         )
