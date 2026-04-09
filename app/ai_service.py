@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import re
+import time
 import uuid
 
 import httpx
@@ -337,14 +338,38 @@ async def call_ai_model(
     if destination:
         user_content += f"Destination context: {destination}\n\n"
     user_content += f"Parse this itinerary:\n\n{text}"
+    return await call_ai_json(
+        token_info=token_info,
+        provider=provider,
+        system_prompt=SYSTEM_PROMPT,
+        user_content=user_content,
+        temperature=0.1,
+        max_tokens=2048,
+        request_label="parse_itinerary",
+        destination=destination,
+        text_length=len(text),
+    )
 
+
+async def call_ai_json(
+    token_info: dict,
+    provider: str,
+    system_prompt: str,
+    user_content: str,
+    *,
+    temperature: float = 0.1,
+    max_tokens: int = 2048,
+    request_label: str = "json_request",
+    destination: str | None = None,
+    text_length: int | None = None,
+) -> dict:
     payload = {
         "model": token_info["model"],
-        "temperature": 0.1,
-        "max_tokens": 2048,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
     }
@@ -356,13 +381,15 @@ async def call_ai_model(
     }
 
     timeout = httpx.Timeout(settings.ai_request_timeout_seconds)
+    started_at = time.perf_counter()
     logger.info(
-        "ai request provider=%s configured_model=%s base_url=%s destination=%s text_length=%s",
+        "ai request label=%s provider=%s configured_model=%s base_url=%s destination=%s text_length=%s",
+        request_label,
         provider,
         token_info["model"],
         base_url,
         destination or "",
-        len(text),
+        text_length if text_length is not None else len(user_content),
     )
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(f"{base_url}/v1/chat/completions", json=payload, headers=headers)
@@ -371,9 +398,11 @@ async def call_ai_model(
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
     logger.info(
-        "ai raw response provider=%s configured_model=%s content=%s",
+        "ai raw response label=%s provider=%s configured_model=%s elapsed=%.3fs content=%s",
+        request_label,
         provider,
         token_info["model"],
+        time.perf_counter() - started_at,
         content,
     )
 
@@ -383,7 +412,8 @@ async def call_ai_model(
 
     parsed_content = json.loads(content)
     logger.info(
-        "ai parsed response provider=%s configured_model=%s payload=%s",
+        "ai parsed response label=%s provider=%s configured_model=%s payload=%s",
+        request_label,
         provider,
         token_info["model"],
         json.dumps(parsed_content, ensure_ascii=False),
@@ -625,6 +655,7 @@ async def parse_itinerary_from_ai_output(
     ai_output: dict,
     destination: str | None,
     language: str,
+    preserve_unresolved: bool = False,
 ) -> ParseItineraryResponse:
     resolved_destination = ai_output.get("destination", destination or "")
     resolved_region = ai_output.get("region", resolved_destination)
@@ -768,9 +799,11 @@ async def parse_itinerary_from_ai_output(
             location = location_map.get((day_idx, act_idx))
             if location is None:
                 warnings.append(f"Skipped unresolved activity: {act.get('title', '')}")
-                logger.info("ai parse skip unresolved activity title=%s", act.get("title", ""))
-                continue
-            geocoded_locations.append(location)
+                logger.info("ai parse skip unresolved activity title=%s preserve=%s", act.get("title", ""), preserve_unresolved)
+                if not preserve_unresolved:
+                    continue
+            else:
+                geocoded_locations.append(location)
 
             activities.append(ActivityResponse(
                 id=str(uuid.uuid4()),
@@ -1020,6 +1053,10 @@ def geocode_query_candidates(
     boarding_point_hint: str = "",
 ) -> list[str]:
     candidates: list[str] = []
+    has_cjk_title = bool(cjk_only(compact_match_key(title)))
+    search_name_is_ascii_like = bool(search_name) and not bool(cjk_only(compact_match_key(search_name)))
+    destination_has_cjk = bool(cjk_only(compact_match_key(destination or "")))
+    country_has_cjk = bool(cjk_only(compact_match_key(country or "")))
 
     # For China, ONLY use Chinese queries
     is_china = (country_code and country_code.upper() == "CN") or (country and any(cn in country.lower() for cn in ["中国", "china", "中華", "中华"]))
@@ -1048,32 +1085,53 @@ def geocode_query_candidates(
                 candidates.append(trimmed_base)
     else:
         # For non-China: prefer structured English hints first
+        candidates.extend(rewritten_landmark_queries(search_name))
+        if not search_name_is_ascii_like:
+            candidates.extend(rewritten_landmark_queries(title))
+
+        candidates.extend([search_name, simplify_activity_query(search_name)])
         if boarding_point_hint:
-            candidates.extend(build_structured_hint_queries(boarding_point_hint, destination, country))
+            candidates.extend(
+                build_structured_hint_queries(
+                    boarding_point_hint,
+                    destination,
+                    country,
+                    destination_has_cjk=destination_has_cjk,
+                    country_has_cjk=country_has_cjk,
+                )
+            )
         if place_hint:
-            candidates.extend(build_structured_hint_queries(place_hint, destination, country))
+            candidates.extend(
+                build_structured_hint_queries(
+                    place_hint,
+                    destination,
+                    country,
+                    destination_has_cjk=destination_has_cjk,
+                    country_has_cjk=country_has_cjk,
+                )
+            )
         if location_mode == "boarding_point_required":
             candidates.extend(build_boarding_queries(search_name, title, destination, country))
-
-        candidates.extend(rewritten_landmark_queries(search_name))
-        candidates.extend(rewritten_landmark_queries(title))
-        candidates.extend([search_name, simplify_activity_query(search_name), title])
+        if not (search_name_is_ascii_like and has_cjk_title):
+            candidates.append(title)
 
         title_base = " ".join((title or "").split())
-        if title_base and destination and location_mode != "boarding_point_required":
+        if title_base and destination and location_mode != "boarding_point_required" and not (search_name_is_ascii_like and has_cjk_title):
             candidates.append(f"{title_base} {destination}")
-            if country:
+            if country and not (country_has_cjk and search_name_is_ascii_like):
                 candidates.append(f"{title_base} {destination} {country}")
 
         search_base = " ".join((search_name or "").split())
-        if search_base and destination:
+        if search_base and destination and not (destination_has_cjk and search_name_is_ascii_like):
             candidates.append(f"{search_base} {destination}")
-            if country:
+            if country and not (country_has_cjk and search_name_is_ascii_like):
                 candidates.append(f"{search_base} {destination} {country}")
 
-        for base in [simplify_activity_query(title), simplify_activity_query(search_name)]:
+        for base in [simplify_activity_query(search_name), simplify_activity_query(title)]:
             trimmed_base = " ".join((base or "").split())
             if not trimmed_base or trimmed_base in {title_base, search_base}:
+                continue
+            if search_name_is_ascii_like and has_cjk_title and trimmed_base == simplify_activity_query(title):
                 continue
             if destination:
                 candidates.append(f"{trimmed_base} {destination}")
@@ -1084,6 +1142,7 @@ def geocode_query_candidates(
 
     deduped: list[str] = []
     seen: set[str] = set()
+    max_candidates = 4 if is_china else 6
     for item in candidates:
         trimmed = " ".join((item or "").split())
         if not trimmed:
@@ -1093,19 +1152,26 @@ def geocode_query_candidates(
             continue
         seen.add(normalized)
         deduped.append(trimmed)
-        if len(deduped) >= 4:
+        if len(deduped) >= max_candidates:
             break
     return deduped
 
 
-def build_structured_hint_queries(hint: str, destination: str | None, country: str | None) -> list[str]:
+def build_structured_hint_queries(
+    hint: str,
+    destination: str | None,
+    country: str | None,
+    *,
+    destination_has_cjk: bool = False,
+    country_has_cjk: bool = False,
+) -> list[str]:
     normalized_hint = " ".join((hint or "").split())
     if not normalized_hint:
         return []
     queries = [normalized_hint]
-    if destination:
+    if destination and not (destination_has_cjk and is_ascii_like_text(normalized_hint)):
         queries.append(f"{normalized_hint} {destination}")
-        if country:
+        if country and not (country_has_cjk and is_ascii_like_text(normalized_hint)):
             queries.append(f"{normalized_hint} {destination} {country}")
     return queries
 
@@ -1398,6 +1464,13 @@ def compact_match_key(value: str | None) -> str:
     normalized = normalized.replace("'", " ")
     normalized = re.sub(r"[^\w\u4e00-\u9fff]+", " ", normalized)
     return "".join(normalized.split())
+
+
+def is_ascii_like_text(value: str | None) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return not bool(cjk_only(compact_match_key(text)))
 
 
 def soft_name_match(left: str, right: str) -> bool:

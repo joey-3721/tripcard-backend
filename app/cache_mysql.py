@@ -212,6 +212,13 @@ class MySQLCache:
                     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
                     """
                 )
+                cur.execute(
+                    """
+                    ALTER TABLE `place_geocode_cache`
+                    MODIFY COLUMN `cache_item_key` VARCHAR(255) NOT NULL,
+                    MODIFY COLUMN `place_id` VARCHAR(512) NULL
+                    """
+                )
 
     def get_gaode_cache(self, query: str, limit: int = 20) -> list[dict] | None:
         """Get cached Gaode results for a query."""
@@ -558,6 +565,9 @@ class MySQLCache:
 
     def _cache_item_key(self, place_id: str | None, name: str, latitude: float, longitude: float) -> str:
         if place_id:
-            return str(place_id)
+            normalized_place_id = str(place_id)
+            if len(normalized_place_id) <= 200:
+                return normalized_place_id
+            return hashlib.md5(normalized_place_id.encode("utf-8")).hexdigest()
         fallback = f"{name.strip().lower()}|{latitude:.6f}|{longitude:.6f}"
         return hashlib.md5(fallback.encode("utf-8")).hexdigest()
