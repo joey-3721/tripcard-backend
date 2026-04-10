@@ -263,7 +263,7 @@ async def execute_place_search_fuzzy(request: PlaceSearchRequest) -> PlaceSearch
             ),
         )
 
-    cache_key = build_cache_key(request, variant="fuzzy")
+    cache_key = build_fuzzy_place_search_cache_key(request)
     if cache is not None:
         cached = cache.get_place_fuzzy_search_cache(cache_key)
         if cached is not None:
@@ -439,6 +439,26 @@ def should_use_china_provider(request: PlaceSearchRequest) -> bool:
 def build_cache_key(request: PlaceSearchRequest, variant: str = "default") -> str:
     payload = json.dumps(
         {"cache_version": 7, "variant": variant, **request.model_dump(mode="json")},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_fuzzy_place_search_cache_key(request: PlaceSearchRequest) -> str:
+    normalized_query = normalize(request.query)
+    preferred_codes = [code.upper() for code in request.preferred_country_codes if code]
+    country_code = (request.country_filter_code or "").strip().upper()
+    if not country_code and preferred_codes:
+        country_code = preferred_codes[0]
+
+    payload = json.dumps(
+        {
+            "cache_version": 1,
+            "variant": "place_search_fuzzy",
+            "query": normalized_query,
+            "country_code": country_code,
+        },
         ensure_ascii=False,
         sort_keys=True,
     )
