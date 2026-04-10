@@ -45,6 +45,28 @@ cache = MySQLCache() if settings.cache_enabled else None
 db = MySQLCache()  # for ai_tokens table operations
 user_store = MySQLUserStore()
 opencc_t2s = OpenCC("t2s")
+GEOGRAPHIC_PLACE_TYPE_HINTS = {
+    "administrative",
+    "administrative_area_level_1",
+    "administrative_area_level_2",
+    "administrative_area_level_3",
+    "borough",
+    "city",
+    "county",
+    "district",
+    "locality",
+    "municipality",
+    "neighborhood",
+    "neighbourhood",
+    "quarter",
+    "region",
+    "state",
+    "subdistrict",
+    "sublocality",
+    "suburb",
+    "town",
+    "village",
+}
 
 
 @asynccontextmanager
@@ -528,7 +550,61 @@ def has_acceptable_ranked_results(results: list[PlaceResult], request: PlaceSear
         return has_meaningful_name_overlap(request.query, top.name)
     if is_named_lookup:
         return has_address_signal and (top.score or 0) >= 0.72
+    if is_broad_geographic_query(request) and is_geographic_result_match(top, request):
+        return True
+    if has_broad_place_search_candidates(results, request):
+        return True
     return has_address_signal or has_context_signal
+
+
+def is_broad_geographic_query(request: PlaceSearchRequest) -> bool:
+    if request.category != "other":
+        return False
+    normalized_query = normalize(request.query)
+    if not normalized_query:
+        return False
+    return len(normalized_query.split()) == 1
+
+
+def is_geographic_result_match(result: PlaceResult, request: PlaceSearchRequest) -> bool:
+    candidate_type = normalize(result.place_type or "").replace(" ", "_")
+    if not candidate_type:
+        return False
+    if not any(hint in candidate_type for hint in GEOGRAPHIC_PLACE_TYPE_HINTS):
+        return False
+
+    preferred_codes = {code.upper() for code in request.preferred_country_codes if code}
+    result_country_code = (result.country_code or "").upper()
+    if request.country_filter_code and result_country_code == request.country_filter_code.upper():
+        return True
+    if preferred_codes and result_country_code in preferred_codes:
+        return True
+    if "destination_context_match" in set(result.matched_by or []):
+        return True
+    return False
+
+
+def has_broad_place_search_candidates(results: list[PlaceResult], request: PlaceSearchRequest) -> bool:
+    if request.category != "other":
+        return False
+
+    preferred_codes = {code.upper() for code in request.preferred_country_codes if code}
+    requested_filter = (request.country_filter_code or "").upper()
+
+    for result in results[:5]:
+        matched = set(result.matched_by or [])
+        result_country_code = (result.country_code or "").upper()
+
+        if requested_filter and result_country_code and result_country_code != requested_filter:
+            continue
+        if preferred_codes and result_country_code and result_country_code not in preferred_codes:
+            if "destination_context_match" not in matched:
+                continue
+        if not (result.name and (result.address or result.subtitle or result.locality or result.place_type)):
+            continue
+        return True
+
+    return False
 
 
 def has_meaningful_name_overlap(query: str, candidate_name: str | None) -> bool:
