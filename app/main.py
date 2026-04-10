@@ -209,7 +209,7 @@ async def execute_place_search(
                     merged.extend(geoapify_batches.get(candidate, []))
                 if any(geoapify_batches.get(candidate, []) for candidate in context_queries):
                     providers_used.append("geoapify")
-            elif geoapify_acceptable:
+            elif geoapify_acceptable or has_any_batch_results(geoapify_batches, context_queries):
                 for candidate in context_queries:
                     merged.extend(geoapify_batches.get(candidate, []))
                 providers_used.append("geoapify")
@@ -217,7 +217,7 @@ async def execute_place_search(
                 purge_unacceptable_provider_cache("geoapify", geoapify_batches, request, context_queries)
                 google_batches = await fetch_google_place_search_batches(client, context_queries, request)
                 google_acceptable = has_acceptable_batch_results(google_batches, request, context_queries)
-                if google_acceptable:
+                if google_acceptable or has_any_batch_results(google_batches, context_queries):
                     for candidate in context_queries:
                         merged.extend(google_batches.get(candidate, []))
                     providers_used.append("google")
@@ -507,6 +507,13 @@ def has_acceptable_batch_results(
         if has_acceptable_ranked_results(ranked, acceptance_request):
             return True
     return False
+
+
+def has_any_batch_results(
+    batches: dict[str, list[ProviderPlace]],
+    context_queries: list[str],
+) -> bool:
+    return any(batches.get(candidate, []) for candidate in context_queries)
 
 
 def purge_unacceptable_provider_cache(

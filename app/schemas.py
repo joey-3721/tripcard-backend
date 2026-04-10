@@ -35,7 +35,7 @@ class PlaceSearchRequest(BaseModel):
     destination_context: DestinationContext | None = None
     user_location: CoordinatePayload | None = None
     language: str = "zh-CN"
-    limit: int = 12
+    limit: int = 20
 
 
 class PlaceResult(BaseModel):
