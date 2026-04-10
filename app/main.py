@@ -75,6 +75,8 @@ async def lifespan(_: FastAPI):
     if cache is not None:
         cache.ensure_table()
         cache.cleanup()
+        cache.ensure_place_fuzzy_search_cache_table()
+        cache.cleanup_place_fuzzy_search_cache()
     user_store.ensure_users_table()
     db.ensure_ai_tokens_table()
     db.ensure_ai_parse_cache_table()
@@ -125,6 +127,11 @@ async def update_user_profile(uid: str, request: UpdateUserProfileRequest) -> Us
 @app.post("/v1/place-search", response_model=PlaceSearchResponse)
 async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
     return await execute_place_search(request)
+
+
+@app.post("/v1/place-search-fuzzy", response_model=PlaceSearchResponse)
+async def place_search_fuzzy(request: PlaceSearchRequest) -> PlaceSearchResponse:
+    return await execute_place_search_fuzzy(request)
 
 
 async def execute_place_search(
@@ -231,6 +238,95 @@ async def execute_place_search(
         )
     if cache is not None and response.results:
         cache.set(
+            cache_key,
+            json.loads(response.model_dump_json()),
+            settings.cache_ttl_seconds,
+        )
+    return response
+
+
+async def execute_place_search_fuzzy(request: PlaceSearchRequest) -> PlaceSearchResponse:
+    trace_id = str(uuid.uuid4())
+    query = request.query.strip()
+    if not query:
+        return PlaceSearchResponse(
+            query=request.query,
+            trace_id=trace_id,
+            results=[],
+            meta=PlaceSearchMeta(
+                scope=request.scope,
+                country_filter_code=request.country_filter_code,
+                preferred_country_codes=request.preferred_country_codes,
+                providers_used=[],
+                cache_hit=False,
+                self_hosted_data=False,
+            ),
+        )
+
+    cache_key = build_cache_key(request, variant="fuzzy")
+    if cache is not None:
+        cached = cache.get_place_fuzzy_search_cache(cache_key)
+        if cached is not None:
+            cached["trace_id"] = trace_id
+            cached["meta"]["cache_hit"] = True
+            return PlaceSearchResponse.model_validate(cached)
+
+    context_queries = build_queries(query, request)
+    providers_used: list[str] = []
+    merged: list[ProviderPlace] = []
+    fallback_used = False
+
+    headers = {"User-Agent": settings.user_agent}
+    timeout = httpx.Timeout(settings.request_timeout_seconds)
+    async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
+        use_china_provider = should_use_china_provider(request)
+        if use_china_provider:
+            for candidate in context_queries:
+                try:
+                    merged.extend(
+                        await search_gaode(
+                            client,
+                            candidate,
+                            request.language,
+                            request.country_filter_code,
+                            request.limit,
+                        )
+                    )
+                    if "gaode" not in providers_used:
+                        providers_used.append("gaode")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("gaode fuzzy failed query=%s error=%r", candidate, exc)
+        else:
+            geoapify_batches = await fetch_geoapify_place_search_batches(client, context_queries, request)
+            for candidate in context_queries:
+                merged.extend(geoapify_batches.get(candidate, []))
+            if has_any_batch_results(geoapify_batches, context_queries):
+                providers_used.append("geoapify")
+            else:
+                google_batches = await fetch_google_place_search_batches(client, context_queries, request)
+                for candidate in context_queries:
+                    merged.extend(google_batches.get(candidate, []))
+                if has_any_batch_results(google_batches, context_queries):
+                    providers_used.append("google")
+                    fallback_used = True
+
+    results = rank_and_convert(merged, request)
+    response = PlaceSearchResponse(
+        query=request.query,
+        trace_id=trace_id,
+        results=results[: request.limit],
+        meta=PlaceSearchMeta(
+            scope=request.scope,
+            country_filter_code=request.country_filter_code,
+            preferred_country_codes=request.preferred_country_codes,
+            fallback_used=fallback_used,
+            providers_used=providers_used,
+            cache_hit=False,
+            self_hosted_data=False,
+        ),
+    )
+    if cache is not None and response.results:
+        cache.set_place_fuzzy_search_cache(
             cache_key,
             json.loads(response.model_dump_json()),
             settings.cache_ttl_seconds,

@@ -13,6 +13,7 @@ from app.config import settings
 class MySQLCache:
     def __init__(self) -> None:
         self.table_name = settings.cache_table_name
+        self.place_fuzzy_cache_table_name = "place_fuzzy_search_cache"
 
     def _connect(self):
         return pymysql.connect(
@@ -82,6 +83,63 @@ class MySQLCache:
             with conn.cursor() as cur:
                 cur.execute(
                     f"DELETE FROM `{self.table_name}` WHERE expires_at <= NOW()"
+                )
+
+    def ensure_place_fuzzy_search_cache_table(self) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS `{self.place_fuzzy_cache_table_name}` (
+                        cache_key VARCHAR(64) PRIMARY KEY,
+                        payload LONGTEXT NOT NULL,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        expires_at DATETIME NOT NULL,
+                        INDEX idx_expires_at (expires_at)
+                    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+                    """
+                )
+
+    def get_place_fuzzy_search_cache(self, cache_key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT payload
+                    FROM `{self.place_fuzzy_cache_table_name}`
+                    WHERE cache_key = %s
+                      AND expires_at > NOW()
+                    LIMIT 1
+                    """,
+                    (cache_key,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return json.loads(row["payload"])
+
+    def set_place_fuzzy_search_cache(self, cache_key: str, payload: dict[str, Any], ttl_seconds: int) -> None:
+        expires_at = int(time.time()) + ttl_seconds
+        encoded = json.dumps(payload, ensure_ascii=False)
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    INSERT INTO `{self.place_fuzzy_cache_table_name}` (cache_key, payload, expires_at)
+                    VALUES (%s, %s, FROM_UNIXTIME(%s))
+                    ON DUPLICATE KEY UPDATE
+                        payload = VALUES(payload),
+                        expires_at = VALUES(expires_at),
+                        created_at = CURRENT_TIMESTAMP
+                    """,
+                    (cache_key, encoded, expires_at),
+                )
+
+    def cleanup_place_fuzzy_search_cache(self) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"DELETE FROM `{self.place_fuzzy_cache_table_name}` WHERE expires_at <= NOW()"
                 )
 
     def ensure_ai_tokens_table(self) -> None:
