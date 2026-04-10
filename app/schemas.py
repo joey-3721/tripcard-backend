@@ -220,3 +220,47 @@ class ParseItineraryAsyncStatusResponse(BaseModel):
     message: str = ""
     result: ParseItinerarySmartResponse | None = None
     error: str | None = None
+
+
+MembershipTierType = Literal["free", "pro", "lifetime"]
+MembershipStatusType = Literal["inactive", "active", "grace_period", "expired"]
+
+
+class AppleUserSignInRequest(BaseModel):
+    uid: str | None = None
+    appleUserId: str
+    identityToken: str | None = None
+    authorizationCode: str | None = None
+    email: str | None = None
+    emailIsPrivateRelay: bool = False
+    displayName: str | None = None
+    avatarBase64: str | None = None
+    avatarContentType: str | None = None
+
+
+class UpdateUserProfileRequest(BaseModel):
+    appleUserId: str | None = None
+    displayName: str | None = None
+    avatarBase64: str | None = None
+    avatarContentType: str | None = None
+
+
+class UserProfileResponse(BaseModel):
+    uid: str
+    appleUserId: str
+    email: str | None = None
+    emailIsPrivateRelay: bool = False
+    displayName: str | None = None
+    hasAvatar: bool = False
+    membershipTier: MembershipTierType = "free"
+    membershipStatus: MembershipStatusType = "inactive"
+    membershipProductId: str | None = None
+    membershipExpiresAt: str | None = None
+    lastSignInAt: str | None = None
+    createdAt: str | None = None
+    updatedAt: str | None = None
+
+
+class UserSyncResponse(BaseModel):
+    created: bool = False
+    user: UserProfileResponse

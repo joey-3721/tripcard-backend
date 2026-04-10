@@ -21,7 +21,9 @@ from app.providers.base import ProviderPlace
 from app.providers.gaode import search_gaode
 from app.providers.geoapify import fetch_geoapify_batch, search_geoapify
 from app.providers.google_places import fetch_google_places_batch, search_google_places
+from app.user_store import MySQLUserStore, UserConflictError, UserNotFoundError, UserValidationError
 from app.schemas import (
+    AppleUserSignInRequest,
     ParseItineraryRequest,
     ParseItineraryResponse,
     ParseItineraryResponseNoLocation,
@@ -32,12 +34,16 @@ from app.schemas import (
     PlaceSearchMeta,
     PlaceSearchRequest,
     PlaceSearchResponse,
+    UpdateUserProfileRequest,
+    UserProfileResponse,
+    UserSyncResponse,
 )
 
 logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
 logger = logging.getLogger("tripcard-backend")
 cache = MySQLCache() if settings.cache_enabled else None
 db = MySQLCache()  # for ai_tokens table operations
+user_store = MySQLUserStore()
 opencc_t2s = OpenCC("t2s")
 
 
@@ -47,6 +53,7 @@ async def lifespan(_: FastAPI):
     if cache is not None:
         cache.ensure_table()
         cache.cleanup()
+    user_store.ensure_users_table()
     db.ensure_ai_tokens_table()
     db.ensure_ai_parse_cache_table()
     db.ensure_ai_parse_jobs_table()
@@ -67,6 +74,30 @@ app.add_middleware(
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/v1/users/apple/sign-in", response_model=UserSyncResponse)
+async def apple_sign_in(request: AppleUserSignInRequest) -> UserSyncResponse:
+    try:
+        user, created = user_store.upsert_apple_user(request.model_dump())
+        return UserSyncResponse(created=created, user=UserProfileResponse.model_validate(user))
+    except UserValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except UserConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.patch("/v1/users/{uid}/profile", response_model=UserSyncResponse)
+async def update_user_profile(uid: str, request: UpdateUserProfileRequest) -> UserSyncResponse:
+    try:
+        user = user_store.update_user_profile(uid, request.model_dump())
+        return UserSyncResponse(created=False, user=UserProfileResponse.model_validate(user))
+    except UserValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except UserConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except UserNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/v1/place-search", response_model=PlaceSearchResponse)
