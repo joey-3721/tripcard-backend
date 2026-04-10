@@ -124,17 +124,11 @@ async def update_user_profile(uid: str, request: UpdateUserProfileRequest) -> Us
 
 @app.post("/v1/place-search", response_model=PlaceSearchResponse)
 async def place_search(request: PlaceSearchRequest) -> PlaceSearchResponse:
-    return await execute_place_search(request, geoapify_only=False)
-
-
-@app.post("/v1/place-search-geoapify", response_model=PlaceSearchResponse)
-async def place_search_geoapify(request: PlaceSearchRequest) -> PlaceSearchResponse:
-    return await execute_place_search(request, geoapify_only=True)
+    return await execute_place_search(request)
 
 
 async def execute_place_search(
     request: PlaceSearchRequest,
-    geoapify_only: bool,
 ) -> PlaceSearchResponse:
     trace_id = str(uuid.uuid4())
     query = request.query.strip()
@@ -168,7 +162,7 @@ async def execute_place_search(
             ),
         )
 
-    cache_key = build_cache_key(request, variant="geoapify_only" if geoapify_only else "default")
+    cache_key = build_cache_key(request)
     if cache is not None:
         cached = cache.get(cache_key)
         if cached is not None:
@@ -185,7 +179,7 @@ async def execute_place_search(
     timeout = httpx.Timeout(settings.request_timeout_seconds)
     async with httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=True) as client:
         use_china_provider = should_use_china_provider(request)
-        if use_china_provider and not geoapify_only:
+        if use_china_provider:
             for candidate in context_queries:
                 try:
                     merged.extend(
@@ -204,20 +198,15 @@ async def execute_place_search(
         else:
             geoapify_batches = await fetch_geoapify_place_search_batches(client, context_queries, request)
             geoapify_acceptable = has_acceptable_batch_results(geoapify_batches, request, context_queries)
-            if geoapify_only:
-                for candidate in context_queries:
-                    merged.extend(geoapify_batches.get(candidate, []))
-                if any(geoapify_batches.get(candidate, []) for candidate in context_queries):
-                    providers_used.append("geoapify")
-            elif geoapify_acceptable or has_any_batch_results(geoapify_batches, context_queries):
+            if geoapify_acceptable:
                 for candidate in context_queries:
                     merged.extend(geoapify_batches.get(candidate, []))
                 providers_used.append("geoapify")
-            elif not geoapify_only:
+            else:
                 purge_unacceptable_provider_cache("geoapify", geoapify_batches, request, context_queries)
                 google_batches = await fetch_google_place_search_batches(client, context_queries, request)
                 google_acceptable = has_acceptable_batch_results(google_batches, request, context_queries)
-                if google_acceptable or has_any_batch_results(google_batches, context_queries):
+                if google_acceptable:
                     for candidate in context_queries:
                         merged.extend(google_batches.get(candidate, []))
                     providers_used.append("google")
