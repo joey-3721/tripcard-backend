@@ -182,7 +182,12 @@ async def execute_place_search(
         else:
             geoapify_batches = await fetch_geoapify_place_search_batches(client, context_queries, request)
             geoapify_acceptable = has_acceptable_batch_results(geoapify_batches, request, context_queries)
-            if geoapify_acceptable:
+            if geoapify_only:
+                for candidate in context_queries:
+                    merged.extend(geoapify_batches.get(candidate, []))
+                if any(geoapify_batches.get(candidate, []) for candidate in context_queries):
+                    providers_used.append("geoapify")
+            elif geoapify_acceptable:
                 for candidate in context_queries:
                     merged.extend(geoapify_batches.get(candidate, []))
                 providers_used.append("geoapify")
