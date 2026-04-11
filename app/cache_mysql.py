@@ -92,47 +92,127 @@ class MySQLCache:
                     f"""
                     CREATE TABLE IF NOT EXISTS `{self.place_fuzzy_cache_table_name}` (
                         cache_key VARCHAR(64) PRIMARY KEY,
+                        variant VARCHAR(32) NOT NULL DEFAULT 'place_search_fuzzy',
+                        query_text VARCHAR(500) NOT NULL,
+                        query_text_normalized VARCHAR(500) NOT NULL,
+                        country_code VARCHAR(8) NULL,
+                        query_options_json JSON NULL,
                         payload LONGTEXT NOT NULL,
                         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                         expires_at DATETIME NOT NULL,
-                        INDEX idx_expires_at (expires_at)
+                        INDEX idx_expires_at (expires_at),
+                        INDEX idx_variant_query_country (variant, query_text_normalized(191), country_code)
                     ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
                     """
                 )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name=self.place_fuzzy_cache_table_name,
+                    column_name="variant",
+                    definition="VARCHAR(32) NOT NULL DEFAULT 'place_search_fuzzy'",
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name=self.place_fuzzy_cache_table_name,
+                    column_name="query_text",
+                    definition="VARCHAR(500) NOT NULL DEFAULT ''",
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name=self.place_fuzzy_cache_table_name,
+                    column_name="query_text_normalized",
+                    definition="VARCHAR(500) NOT NULL DEFAULT ''",
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name=self.place_fuzzy_cache_table_name,
+                    column_name="country_code",
+                    definition="VARCHAR(8) NULL",
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name=self.place_fuzzy_cache_table_name,
+                    column_name="query_options_json",
+                    definition="JSON NULL",
+                )
+                self._ensure_column_exists(
+                    cur=cur,
+                    table_name=self.place_fuzzy_cache_table_name,
+                    column_name="updated_at",
+                    definition="DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+                )
 
-    def get_place_fuzzy_search_cache(self, cache_key: str) -> dict[str, Any] | None:
+    def get_place_fuzzy_search_cache(
+        self,
+        variant: str,
+        query_text_normalized: str,
+        country_code: str | None,
+    ) -> dict[str, Any] | None:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
                     SELECT payload
                     FROM `{self.place_fuzzy_cache_table_name}`
-                    WHERE cache_key = %s
+                    WHERE variant = %s
+                      AND query_text_normalized = %s
+                      AND (
+                          (%s IS NULL AND country_code IS NULL)
+                          OR country_code = %s
+                      )
                       AND expires_at > NOW()
+                    ORDER BY updated_at DESC
                     LIMIT 1
                     """,
-                    (cache_key,),
+                    (variant, query_text_normalized, country_code, country_code),
                 )
                 row = cur.fetchone()
                 if row is None:
                     return None
                 return json.loads(row["payload"])
 
-    def set_place_fuzzy_search_cache(self, cache_key: str, payload: dict[str, Any], ttl_seconds: int) -> None:
+    def set_place_fuzzy_search_cache(
+        self,
+        cache_key: str,
+        variant: str,
+        query_text: str,
+        query_text_normalized: str,
+        country_code: str | None,
+        query_options: dict[str, Any] | None,
+        payload: dict[str, Any],
+        ttl_seconds: int,
+    ) -> None:
         expires_at = int(time.time()) + ttl_seconds
         encoded = json.dumps(payload, ensure_ascii=False)
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
-                    INSERT INTO `{self.place_fuzzy_cache_table_name}` (cache_key, payload, expires_at)
-                    VALUES (%s, %s, FROM_UNIXTIME(%s))
+                    INSERT INTO `{self.place_fuzzy_cache_table_name}`
+                    (cache_key, variant, query_text, query_text_normalized, country_code, query_options_json, payload, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, FROM_UNIXTIME(%s))
                     ON DUPLICATE KEY UPDATE
+                        variant = VALUES(variant),
+                        query_text = VALUES(query_text),
+                        query_text_normalized = VALUES(query_text_normalized),
+                        country_code = VALUES(country_code),
+                        query_options_json = VALUES(query_options_json),
                         payload = VALUES(payload),
                         expires_at = VALUES(expires_at),
-                        created_at = CURRENT_TIMESTAMP
+                        created_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
                     """,
-                    (cache_key, encoded, expires_at),
+                    (
+                        cache_key,
+                        variant,
+                        query_text,
+                        query_text_normalized,
+                        country_code,
+                        json.dumps(query_options, ensure_ascii=False) if query_options is not None else None,
+                        encoded,
+                        expires_at,
+                    ),
                 )
 
     def cleanup_place_fuzzy_search_cache(self) -> None:

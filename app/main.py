@@ -20,7 +20,13 @@ from app.place_query_guard import should_skip_place_query
 from app.providers.base import ProviderPlace
 from app.providers.gaode import search_gaode
 from app.providers.geoapify import fetch_geoapify_batch, search_geoapify
-from app.providers.google_places import fetch_google_places_batch, search_google_places
+from app.providers.google_places import (
+    fetch_google_places_batch,
+    fetch_google_places_fuzzy_batch,
+    search_google_places,
+)
+from app.providers.nominatim import search_nominatim
+from app.providers.photon import search_photon
 from app.user_store import MySQLUserStore, UserConflictError, UserNotFoundError, UserValidationError
 from app.schemas import (
     AppleUserSignInRequest,
@@ -263,9 +269,13 @@ async def execute_place_search_fuzzy(request: PlaceSearchRequest) -> PlaceSearch
             ),
         )
 
-    cache_key = build_fuzzy_place_search_cache_key(request)
+    cache_entry = build_fuzzy_place_search_cache_entry(request)
     if cache is not None:
-        cached = cache.get_place_fuzzy_search_cache(cache_key)
+        cached = cache.get_place_fuzzy_search_cache(
+            variant=cache_entry["variant"],
+            query_text_normalized=cache_entry["query_text_normalized"],
+            country_code=cache_entry["country_code"],
+        )
         if cached is not None:
             cached["trace_id"] = trace_id
             cached["meta"]["cache_hit"] = True
@@ -297,13 +307,32 @@ async def execute_place_search_fuzzy(request: PlaceSearchRequest) -> PlaceSearch
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("gaode fuzzy failed query=%s error=%r", candidate, exc)
         else:
-            geoapify_batches = await fetch_geoapify_place_search_batches(client, context_queries, request)
+            geoapify_task = asyncio.create_task(
+                fetch_geoapify_place_search_batches(client, context_queries, request)
+            )
+            photon_task = asyncio.create_task(
+                fetch_photon_place_search_batches(client, context_queries, request)
+            )
+            geoapify_batches, photon_batches = await asyncio.gather(geoapify_task, photon_task)
+
             for candidate in context_queries:
                 merged.extend(geoapify_batches.get(candidate, []))
             if has_any_batch_results(geoapify_batches, context_queries):
                 providers_used.append("geoapify")
-            else:
-                google_batches = await fetch_google_place_search_batches(client, context_queries, request)
+            for candidate in context_queries:
+                merged.extend(photon_batches.get(candidate, []))
+            if has_any_batch_results(photon_batches, context_queries):
+                providers_used.append("photon")
+
+            if not has_strong_fuzzy_batch_results(merged, request):
+                nominatim_batches = await fetch_nominatim_place_search_batches(client, context_queries, request)
+                for candidate in context_queries:
+                    merged.extend(nominatim_batches.get(candidate, []))
+                if has_any_batch_results(nominatim_batches, context_queries):
+                    providers_used.append("nominatim")
+
+            if not has_strong_fuzzy_batch_results(merged, request):
+                google_batches = await fetch_google_place_search_fuzzy_batches(client, context_queries, request)
                 for candidate in context_queries:
                     merged.extend(google_batches.get(candidate, []))
                 if has_any_batch_results(google_batches, context_queries):
@@ -327,9 +356,14 @@ async def execute_place_search_fuzzy(request: PlaceSearchRequest) -> PlaceSearch
     )
     if cache is not None and response.results:
         cache.set_place_fuzzy_search_cache(
-            cache_key,
-            json.loads(response.model_dump_json()),
-            settings.cache_ttl_seconds,
+            cache_key=cache_entry["cache_key"],
+            variant=cache_entry["variant"],
+            query_text=cache_entry["query_text"],
+            query_text_normalized=cache_entry["query_text_normalized"],
+            country_code=cache_entry["country_code"],
+            query_options=cache_entry["query_options"],
+            payload=json.loads(response.model_dump_json()),
+            ttl_seconds=settings.cache_ttl_seconds,
         )
     return response
 
@@ -400,6 +434,114 @@ async def fetch_google_place_search_batches(
         return batches
 
 
+async def fetch_google_place_search_fuzzy_batches(
+    client: httpx.AsyncClient,
+    context_queries: list[str],
+    request: PlaceSearchRequest,
+) -> dict[str, list[ProviderPlace]]:
+    try:
+        return await fetch_google_places_fuzzy_batch(
+            client=client,
+            queries=context_queries,
+            language=request.language,
+            country_filter_code=request.country_filter_code,
+            limit=request.limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("google fuzzy batch failed error=%r", exc)
+        return {}
+
+
+async def fetch_photon_place_search_batches(
+    client: httpx.AsyncClient,
+    context_queries: list[str],
+    request: PlaceSearchRequest,
+) -> dict[str, list[ProviderPlace]]:
+    photon_db = MySQLCache()
+    cached_rows_by_query = photon_db.get_place_geocode_cache_batch(
+        source="photon",
+        queries=context_queries,
+        language=request.language,
+        country_filter_code=request.country_filter_code,
+        limit=request.limit,
+    )
+
+    batches: dict[str, list[ProviderPlace]] = {}
+    for query in context_queries:
+        cached_results = cached_rows_by_query.get(query) or []
+        if cached_results:
+            logger.info("Photon 缓存命中 query=%s 条数=%d", query, len(cached_results))
+            batches[query] = [row_to_cached_provider_place("photon", row) for row in cached_results]
+            continue
+
+        try:
+            items = await search_photon(
+                client,
+                query,
+                request.language,
+                request.country_filter_code,
+                request.limit,
+            )
+            batches[query] = items
+            if items:
+                photon_db.set_place_geocode_cache(
+                    source="photon",
+                    query=query,
+                    language=request.language,
+                    country_filter_code=request.country_filter_code,
+                    rows=[provider_place_to_cache_row(item) for item in items],
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("photon failed query=%s error=%r", query, exc)
+            batches[query] = []
+    return batches
+
+
+async def fetch_nominatim_place_search_batches(
+    client: httpx.AsyncClient,
+    context_queries: list[str],
+    request: PlaceSearchRequest,
+) -> dict[str, list[ProviderPlace]]:
+    nominatim_db = MySQLCache()
+    cached_rows_by_query = nominatim_db.get_place_geocode_cache_batch(
+        source="nominatim",
+        queries=context_queries,
+        language=request.language,
+        country_filter_code=request.country_filter_code,
+        limit=request.limit,
+    )
+
+    batches: dict[str, list[ProviderPlace]] = {}
+    for query in context_queries:
+        cached_results = cached_rows_by_query.get(query) or []
+        if cached_results:
+            logger.info("Nominatim 缓存命中 query=%s 条数=%d", query, len(cached_results))
+            batches[query] = [row_to_cached_provider_place("nominatim", row) for row in cached_results]
+            continue
+
+        try:
+            items = await search_nominatim(
+                client,
+                query,
+                request.language,
+                request.country_filter_code,
+                request.limit,
+            )
+            batches[query] = items
+            if items:
+                nominatim_db.set_place_geocode_cache(
+                    source="nominatim",
+                    query=query,
+                    language=request.language,
+                    country_filter_code=request.country_filter_code,
+                    rows=[provider_place_to_cache_row(item) for item in items],
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("nominatim failed query=%s error=%r", query, exc)
+            batches[query] = []
+    return batches
+
+
 def build_queries(query: str, request: PlaceSearchRequest) -> list[str]:
     queries = [query]
     destinations = request.destination_context.destinations if request.destination_context else []
@@ -445,16 +587,22 @@ def build_cache_key(request: PlaceSearchRequest, variant: str = "default") -> st
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def build_fuzzy_place_search_cache_key(request: PlaceSearchRequest) -> str:
+def build_fuzzy_place_search_cache_entry(request: PlaceSearchRequest) -> dict[str, object]:
     normalized_query = normalize(request.query)
     preferred_codes = [code.upper() for code in request.preferred_country_codes if code]
     country_code = (request.country_filter_code or "").strip().upper()
     if not country_code and preferred_codes:
         country_code = preferred_codes[0]
 
-    payload = json.dumps(
+    query_options = {
+        "preferred_country_codes": preferred_codes,
+        "language": request.language,
+        "limit": request.limit,
+        "scope": request.scope,
+        "has_destination_context": bool(request.destination_context and request.destination_context.destinations),
+    }
+    key_payload = json.dumps(
         {
-            "cache_version": 1,
             "variant": "place_search_fuzzy",
             "query": normalized_query,
             "country_code": country_code,
@@ -462,7 +610,14 @@ def build_fuzzy_place_search_cache_key(request: PlaceSearchRequest) -> str:
         ensure_ascii=False,
         sort_keys=True,
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return {
+        "cache_key": hashlib.sha256(key_payload.encode("utf-8")).hexdigest(),
+        "variant": "place_search_fuzzy",
+        "query_text": request.query.strip(),
+        "query_text_normalized": normalized_query,
+        "country_code": country_code or None,
+        "query_options": query_options,
+    }
 
 
 def to_simplified_place_text(text: str) -> str:
@@ -619,6 +774,56 @@ def has_any_batch_results(
     context_queries: list[str],
 ) -> bool:
     return any(batches.get(candidate, []) for candidate in context_queries)
+
+
+def has_strong_fuzzy_batch_results(
+    items: list[ProviderPlace],
+    request: PlaceSearchRequest,
+) -> bool:
+    if not items:
+        return False
+    ranked = rank_and_convert(items, request)
+    if not ranked:
+        return False
+    top = ranked[0]
+    matched = set(top.matched_by or [])
+    if "name_exact" in matched or "name_prefix" in matched:
+        return True
+    return bool({"preferred_country_boost", "destination_context_match"} & matched) and (top.score or 0) >= 0.9
+
+
+def row_to_cached_provider_place(source: str, row: dict[str, object]) -> ProviderPlace:
+    return ProviderPlace(
+        provider=source,
+        provider_place_id=str(row.get("place_id") or "") or None,
+        name=str(row.get("name") or ""),
+        subtitle=str(row.get("subtitle") or "") or None,
+        address=str(row.get("address") or "") or None,
+        latitude=float(row["latitude"]),
+        longitude=float(row["longitude"]),
+        country=str(row.get("country") or "") or None,
+        country_code=str(row.get("country_code") or "").upper(),
+        locality=str(row.get("locality") or "") or None,
+        place_type=str(row.get("place_type") or "") or None,
+        category=str(row.get("category") or "") or None,
+    )
+
+
+def provider_place_to_cache_row(item: ProviderPlace) -> dict[str, object]:
+    return {
+        "place_id": item.provider_place_id,
+        "name": item.name,
+        "address": item.address,
+        "subtitle": item.subtitle,
+        "latitude": item.latitude,
+        "longitude": item.longitude,
+        "country": item.country,
+        "country_code": item.country_code,
+        "locality": item.locality,
+        "place_type": item.place_type,
+        "category": item.category,
+        "full_response": None,
+    }
 
 
 def purge_unacceptable_provider_cache(

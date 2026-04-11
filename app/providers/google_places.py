@@ -12,6 +12,7 @@ from app.providers.base import ProviderPlace
 logger = logging.getLogger("tripcard-backend")
 
 GOOGLE_PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+GOOGLE_PLACES_AUTOCOMPLETE_URL = "https://places.googleapis.com/v1/places:autocomplete"
 GOOGLE_PLACES_FIELD_MASK = ",".join(
     [
         "places.id",
@@ -21,6 +22,26 @@ GOOGLE_PLACES_FIELD_MASK = ",".join(
         "places.addressComponents",
         "places.primaryType",
         "places.types",
+    ]
+)
+GOOGLE_PLACES_AUTOCOMPLETE_FIELD_MASK = ",".join(
+    [
+        "suggestions.placePrediction.place",
+        "suggestions.placePrediction.placeId",
+        "suggestions.placePrediction.text.text",
+        "suggestions.placePrediction.structuredFormat.mainText.text",
+        "suggestions.placePrediction.structuredFormat.secondaryText.text",
+    ]
+)
+GOOGLE_PLACES_DETAILS_FIELD_MASK = ",".join(
+    [
+        "id",
+        "displayName",
+        "formattedAddress",
+        "location",
+        "addressComponents",
+        "primaryType",
+        "types",
     ]
 )
 
@@ -33,6 +54,16 @@ async def search_google_places(
     limit: int,
 ) -> list[ProviderPlace]:
     return (await fetch_google_places_batch(client, [query], language, country_filter_code, limit)).get(query, [])
+
+
+async def search_google_places_fuzzy(
+    client: httpx.AsyncClient,
+    query: str,
+    language: str,
+    country_filter_code: str | None,
+    limit: int,
+) -> list[ProviderPlace]:
+    return (await fetch_google_places_fuzzy_batch(client, [query], language, country_filter_code, limit)).get(query, [])
 
 
 async def fetch_google_places_batch(
@@ -107,6 +138,82 @@ async def fetch_google_places_batch(
             logger.warning("Google Places 接口请求失败 query=%s error=%r", query, exc)
             if isinstance(exc, httpx.HTTPStatusError):
                 logger.warning("Google Places 响应体=%s", exc.response.text[:400])
+            results[query] = []
+    return results
+
+
+async def fetch_google_places_fuzzy_batch(
+    client: httpx.AsyncClient,
+    queries: list[str],
+    language: str,
+    country_filter_code: str | None,
+    limit: int,
+    api_enabled: bool = True,
+) -> dict[str, list[ProviderPlace]]:
+    deduped_queries: list[str] = []
+    seen_queries: set[str] = set()
+    for query in queries:
+        normalized = " ".join(str(query).split())
+        if not normalized or normalized in seen_queries:
+            continue
+        seen_queries.add(normalized)
+        deduped_queries.append(query)
+
+    if not deduped_queries:
+        return {}
+
+    db = MySQLCache()
+    cached_rows_by_query = db.get_place_geocode_cache_batch(
+        source="google_fuzzy",
+        queries=deduped_queries,
+        language=language,
+        country_filter_code=country_filter_code,
+        limit=limit,
+    )
+
+    results: dict[str, list[ProviderPlace]] = {}
+    missing_queries: list[str] = []
+    for query in deduped_queries:
+        cached_results = cached_rows_by_query.get(query) or []
+        if cached_results:
+            logger.info("Google Fuzzy 缓存命中 query=%s 条数=%d", query, len(cached_results))
+            results[query] = [row_to_provider_place(row) for row in cached_results]
+        else:
+            missing_queries.append(query)
+
+    if not missing_queries or not api_enabled:
+        for query in missing_queries:
+            results[query] = []
+        return results
+
+    token_row = db.get_ai_token("google")
+    if token_row is None:
+        logger.warning("Google Places token 未在数据库中配置")
+        for query in missing_queries:
+            results[query] = []
+        return results
+
+    tasks = {
+        query: asyncio.create_task(
+            _search_google_places_fuzzy_api(
+                client=client,
+                db=db,
+                token_row=token_row,
+                query=query,
+                language=language,
+                country_filter_code=country_filter_code,
+                limit=limit,
+            )
+        )
+        for query in missing_queries
+    }
+    for query in missing_queries:
+        try:
+            results[query] = await tasks[query]
+        except Exception as exc:
+            logger.warning("Google Fuzzy 接口请求失败 query=%s error=%r", query, exc)
+            if isinstance(exc, httpx.HTTPStatusError):
+                logger.warning("Google Fuzzy 响应体=%s", exc.response.text[:400])
             results[query] = []
     return results
 
@@ -204,6 +311,169 @@ async def _search_google_places_api(
         usage.get("usage_date", ""),
     )
     return items
+
+
+async def _search_google_places_fuzzy_api(
+    client: httpx.AsyncClient,
+    db: MySQLCache,
+    token_row: dict[str, Any],
+    query: str,
+    language: str,
+    country_filter_code: str | None,
+    limit: int,
+) -> list[ProviderPlace]:
+    usage = db.increment_ai_provider_usage("google")
+    if usage is None:
+        logger.warning("Google Fuzzy 用量配置缺失 query=%s", query)
+        return []
+    if not usage.get("allowed", False):
+        logger.warning(
+            "Google Fuzzy 额度不可用 query=%s 月用量=%s/%s 月份=%s 日用量=%s/%s 日期=%s 原因=%s",
+            query,
+            usage.get("monthly_call_count", 0),
+            usage.get("monthly_limit", -1),
+            usage.get("usage_month", ""),
+            usage.get("daily_call_count", 0),
+            usage.get("daily_limit", -1),
+            usage.get("usage_date", ""),
+            usage.get("reason", ""),
+        )
+        return []
+
+    headers = {
+        "X-Goog-Api-Key": token_row["token"],
+        "X-Goog-FieldMask": GOOGLE_PLACES_AUTOCOMPLETE_FIELD_MASK,
+    }
+    body: dict[str, Any] = {
+        "input": query,
+        "languageCode": normalize_google_language(language),
+    }
+    if country_filter_code:
+        body["includedRegionCodes"] = [str(country_filter_code).lower()]
+
+    autocomplete_response = await client.post(
+        GOOGLE_PLACES_AUTOCOMPLETE_URL,
+        headers=headers,
+        json=body,
+    )
+    autocomplete_response.raise_for_status()
+    payload: dict[str, Any] = autocomplete_response.json()
+
+    place_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for suggestion in payload.get("suggestions") or []:
+        prediction = suggestion.get("placePrediction") or {}
+        place_id = str(prediction.get("placeId") or "").strip()
+        if not place_id:
+            place_ref = str(prediction.get("place") or "").strip()
+            if place_ref.startswith("places/"):
+                place_id = place_ref.split("/", 1)[1].strip()
+        if not place_id or place_id in seen_ids:
+            continue
+        seen_ids.add(place_id)
+        place_ids.append(place_id)
+        if len(place_ids) >= min(max(limit, 1), 12):
+            break
+
+    if not place_ids:
+        logger.info(
+            "Google Fuzzy 自动补全无结果 query=%s 月用量=%s/%s 月份=%s 日用量=%s/%s 日期=%s",
+            query,
+            usage.get("monthly_call_count", 0),
+            usage.get("monthly_limit", -1),
+            usage.get("usage_month", ""),
+            usage.get("daily_call_count", 0),
+            usage.get("daily_limit", -1),
+            usage.get("usage_date", ""),
+        )
+        return []
+
+    detail_headers = {
+        "X-Goog-Api-Key": token_row["token"],
+        "X-Goog-FieldMask": GOOGLE_PLACES_DETAILS_FIELD_MASK,
+    }
+    detail_tasks = [
+        asyncio.create_task(
+            _fetch_google_place_detail(
+                client=client,
+                headers=detail_headers,
+                place_id=place_id,
+                language=language,
+                region_code=country_filter_code,
+            )
+        )
+        for place_id in place_ids
+    ]
+
+    items: list[ProviderPlace] = []
+    cache_rows: list[dict[str, Any]] = []
+    for place_id, task in zip(place_ids, detail_tasks):
+        try:
+            row = await task
+        except Exception as exc:
+            logger.warning("Google Fuzzy 详情请求失败 query=%s place_id=%s error=%r", query, place_id, exc)
+            continue
+        item = google_place_to_provider_place(row)
+        if item is None:
+            continue
+        items.append(item)
+        cache_rows.append(
+            {
+                "place_id": item.provider_place_id,
+                "name": item.name,
+                "address": item.address,
+                "subtitle": item.subtitle,
+                "latitude": item.latitude,
+                "longitude": item.longitude,
+                "country": item.country,
+                "country_code": item.country_code,
+                "locality": item.locality,
+                "place_type": item.place_type,
+                "category": item.category,
+                "full_response": row,
+            }
+        )
+
+    if cache_rows:
+        db.set_place_geocode_cache(
+            source="google_fuzzy",
+            query=query,
+            language=language,
+            country_filter_code=country_filter_code,
+            rows=cache_rows,
+        )
+
+    logger.info(
+        "Google Fuzzy 查询完成并写入缓存 query=%s 结果数=%d 月用量=%s/%s 月份=%s 日用量=%s/%s 日期=%s",
+        query,
+        len(items),
+        usage.get("monthly_call_count", 0),
+        usage.get("monthly_limit", -1),
+        usage.get("usage_month", ""),
+        usage.get("daily_call_count", 0),
+        usage.get("daily_limit", -1),
+        usage.get("usage_date", ""),
+    )
+    return items
+
+
+async def _fetch_google_place_detail(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    place_id: str,
+    language: str,
+    region_code: str | None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"languageCode": normalize_google_language(language)}
+    if region_code:
+        params["regionCode"] = str(region_code).lower()
+    response = await client.get(
+        f"https://places.googleapis.com/v1/places/{place_id}",
+        headers=headers,
+        params=params,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 def row_to_provider_place(row: dict[str, Any]) -> ProviderPlace:
