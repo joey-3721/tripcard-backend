@@ -11,6 +11,7 @@ from app.ai_service import (
     normalize_day_plans_raw,
     normalize_country_code,
     normalize_ai_provider,
+    normalize_summary_region,
     normalized_summary_title,
     sanitize_activity_notes,
     standardized_activity_title,
@@ -83,6 +84,12 @@ def build_parse_itinerary_no_geocoding_response(
     resolved_region = ai_output.get("region", resolved_destination)
     resolved_country = ai_output.get("country", "")
     resolved_country_code = normalize_country_code(ai_output.get("countryCode", ""))
+    resolved_region = normalize_summary_region(
+        destination=resolved_destination,
+        region=resolved_region,
+        country=resolved_country,
+        country_code=resolved_country_code,
+    )
     day_plans_raw = normalize_day_plans_raw(ai_output.get("dayPlans", []))
 
     # Build response without geocoding

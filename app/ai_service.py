@@ -35,6 +35,7 @@ logger = logging.getLogger("tripcard-backend")
 MAX_DAY_OUTLIER_DISTANCE_KM = 220.0
 MAX_DAY_CITY_MISMATCH_DISTANCE_KM = 60.0
 MIN_ATTRACTION_CONFIDENCE_SCORE = 0.72
+CN_DIRECT_ADMIN_MUNICIPALITIES = {"北京", "上海", "天津", "重庆"}
 SHOPPING_PREFERRED_PLACE_TYPES = {
     "commercial",
     "mall",
@@ -2205,6 +2206,12 @@ def build_summary(
         country = inferred_country or ""
     if not region:
         region = inferred_region or resolved_destination
+    region = normalize_summary_region(
+        destination=resolved_destination,
+        region=region,
+        country=country,
+        country_code=inferred_country_code or "",
+    )
     return ParseItinerarySummaryResponse(
         title=title,
         destination=resolved_destination,
@@ -2234,6 +2241,29 @@ def normalized_summary_title(raw_title: str, destination: str, total_days: int, 
     if lowered == destination.lower():
         return fallback
     return title
+
+
+def normalize_summary_region(
+    destination: str,
+    region: str,
+    country: str,
+    country_code: str,
+) -> str:
+    resolved_destination = str(destination or "").strip()
+    resolved_region = str(region or "").strip()
+    normalized_country_code = normalize_country_code(country_code or "")
+    normalized_country = str(country or "").strip()
+
+    if not resolved_region:
+        return resolved_destination
+    if resolved_region == resolved_destination:
+        return resolved_region
+
+    is_china = normalized_country_code == "CN" or normalized_country in {"中国", "中华人民共和国", "China"}
+    if is_china and resolved_destination in CN_DIRECT_ADMIN_MUNICIPALITIES:
+        return resolved_destination
+
+    return resolved_region
 
 
 def generated_summary_title(destination: str, total_days: int, day_plans_raw: list[dict]) -> str:
